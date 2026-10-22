@@ -1,7 +1,7 @@
 const { createApp, reactive, ref, computed, onMounted } = Vue;
 const { ElMessage, ElMessageBox } = ElementPlus;
 
-const API_BASE = window.HR_API_BASE || 'http://localhost:8080/api';
+const API_BASE = window.HR_API_BASE || '/api';
 const STATUS_OPTIONS = ['在职', '试用期', '离职'];
 
 const TOKEN_KEY = 'hr_token';
@@ -50,7 +50,7 @@ async function request(path, { skipAuthRedirect = false, ...options } = {}) {
     try {
         res = await fetch(API_BASE + path, { ...options, headers });
     } catch (e) {
-        throw new Error('无法连接后端服务，请确认 http://localhost:8080 已启动');
+        throw new Error('无法连接后端服务，请确认后端已启动');
     }
 
     const text = await res.text();
