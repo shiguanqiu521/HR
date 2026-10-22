@@ -1,0 +1,236 @@
+* {
+    box-sizing: border-box;
+}
+
+[v-cloak] {
+    display: none;
+}
+
+body {
+    margin: 0;
+    background: #f0f2f5;
+    font-family: "Microsoft YaHei", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    color: #303133;
+}
+
+.app-header {
+    background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%);
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .15);
+}
+
+.app-header-inner {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.brand-logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, .18);
+    font-weight: 700;
+    font-size: 18px;
+    letter-spacing: .5px;
+}
+
+.brand h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 600;
+}
+
+.brand p {
+    margin: 2px 0 0;
+    font-size: 12px;
+    opacity: .75;
+    letter-spacing: .5px;
+}
+
+.api-state {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    opacity: .95;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+}
+
+.user-area {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    padding-left: 22px;
+    border-left: 1px solid rgba(255, 255, 255, .25);
+}
+
+.user-name {
+    font-weight: 600;
+}
+
+.logout-btn {
+    color: rgba(255, 255, 255, .85);
+}
+
+.logout-btn:hover {
+    color: #fff;
+    background: rgba(255, 255, 255, .15);
+}
+
+.dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot-on {
+    background: #67c23a;
+    box-shadow: 0 0 6px #67c23a;
+}
+
+.dot-off {
+    background: #f56c6c;
+    box-shadow: 0 0 6px #f56c6c;
+}
+
+.app-main {
+    max-width: 1400px;
+    margin: 20px auto;
+    padding: 0 24px;
+}
+
+.panel {
+    border-radius: 8px;
+}
+
+.search-form {
+    padding-bottom: 2px;
+    border-bottom: 1px dashed #ebeef5;
+    margin-bottom: 16px;
+}
+
+.search-form .el-form-item {
+    margin-bottom: 14px;
+}
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 14px;
+}
+
+.total-tip {
+    font-size: 13px;
+    color: #909399;
+}
+
+.total-tip b {
+    color: #409eff;
+    font-size: 15px;
+    margin: 0 2px;
+}
+
+.pager {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 18px;
+}
+
+.el-button .el-icon {
+    vertical-align: -2px;
+}
+
+/* ===== 登录页 ===== */
+.login-page {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%);
+}
+
+.login-card {
+    width: 100%;
+    max-width: 400px;
+    padding: 38px 36px 26px;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
+}
+
+.login-brand {
+    text-align: center;
+    margin-bottom: 28px;
+}
+
+.login-brand .brand-logo {
+    width: 52px;
+    height: 52px;
+    margin-bottom: 14px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%);
+    color: #fff;
+    font-size: 20px;
+}
+
+.login-brand h1 {
+    margin: 0;
+    font-size: 21px;
+    font-weight: 600;
+    color: #303133;
+}
+
+.login-brand p {
+    margin: 6px 0 0;
+    font-size: 12px;
+    letter-spacing: .5px;
+    color: #909399;
+}
+
+.login-form .el-form-item {
+    margin-bottom: 22px;
+}
+
+.login-submit {
+    width: 100%;
+    letter-spacing: 4px;
+}
+
+.login-tip {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px dashed #ebeef5;
+    font-size: 12px;
+    color: #909399;
+}
+
+.login-tip em {
+    margin-left: auto;
+    font-style: normal;
+    color: #c0c4cc;
+}
