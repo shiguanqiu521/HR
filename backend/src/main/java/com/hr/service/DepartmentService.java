@@ -21,7 +21,7 @@ public class DepartmentService {
     @Transactional
     public Department create(DepartmentRequest request) {
         if (repository.existsByNameAndDeleted(request.getName(), 0)) {
-            throw new BizException("部门名称已存在");
+            throw BizException.conflict("部门名称已存在");
         }
         Department dept = new Department();
         dept.setName(request.getName().trim());
@@ -36,7 +36,7 @@ public class DepartmentService {
 
     public Department getDetail(Long id) {
         return repository.findByIdAndDeleted(id, 0)
-                .orElseThrow(() -> new BizException("部门不存在或已删除"));
+                .orElseThrow(() -> BizException.notFound("部门不存在或已删除"));
     }
 
     @Transactional
@@ -44,7 +44,7 @@ public class DepartmentService {
         Department dept = getDetail(id);
         if (!dept.getName().equals(request.getName()) &&
             repository.existsByNameAndDeleted(request.getName(), 0)) {
-            throw new BizException("部门名称已存在");
+            throw BizException.conflict("部门名称已存在");
         }
         dept.setName(request.getName().trim());
         dept.setDescription(request.getDescription() != null ? request.getDescription().trim() : null);
