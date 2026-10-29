@@ -3,13 +3,13 @@
 | 项目 | 内容 |
 | --- | --- |
 | 服务名称 | hr-employee（人员管理系统后端） |
-| 技术栈 | Spring Boot 3.3.5 + Spring JDBC + SQLite 3 |
+| 技术栈 | Spring Boot 3.3.5 + Spring Data JPA + MySQL 8.0 + Redis |
 | 服务地址 | `http://localhost:8080` |
 | 接口前缀 | `/api` |
 | 数据格式 | 请求与响应均为 `application/json;charset=UTF-8` |
 | 日期格式 | `hireDate` 为 `yyyy-MM-dd`；`createdAt` / `updatedAt` 为 `yyyy-MM-dd HH:mm:ss` |
-| 文档版本 | v1.1.0 |
-| 更新日期 | 2026-09-19 |
+| 文档版本 | v2.0.0 |
+| 更新日期 | 2026-10-29 |
 
 ---
 
@@ -44,8 +44,8 @@ HTTP 状态码与响应体 `code` 始终保持一致，便于用任一维度做�
 | 200 | 200 | 成功 | 请求正常处理 |
 | 400 | 400 | 参数校验失败 | 必填项为空、手机号格式错误、状态值不合法、分页参数越界、JSON 无法解析 |
 | 401 | 401 | 未认证 | 未携带 Token、Token 无效或已过期 |
-| 404 | 404 | 资源不存在 | 员工 id 不存在，或该员工已被软删除 |
-| 409 | 409 | 业务冲突 | 手机号已被其他在职记录占用 |
+| 404 | 404 | 资源不存在 | 员工/部门 id 不存在，或该记录已被软删除 |
+| 409 | 409 | 业务冲突 | 手机号已被其他在职记录占用、部门名称已存在 |
 | 500 | 500 | 服务器内部错误 | 未预期的异常 |
 
 ### 1.3 员工状态字典
@@ -69,6 +69,19 @@ HTTP 状态码与响应体 `code` 始终保持一致，便于用任一维度做�
 | position | string | 岗位，必填，最长 50 |
 | hireDate | string | 入职时间，必填，格式 `yyyy-MM-dd` |
 | status | string | 状态，必填，见 1.3 |
+| createdAt | string | 创建时间，服务端生成，只读 |
+| updatedAt | string | 最后更新时间，服务端生成，只读 |
+
+> `deleted`（软删除标记）为数据库内部字段，不在接口响应中暴露。
+
+### 1.5 部门对象（Department）字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | long | 部门主键，数据库自增，创建时不传 |
+| name | string | 部门名称，必填，最长 100，未删除记录内唯一 |
+| description | string | 部门描述，选填，最长 200 |
+| manager | string | 负责人，选填，最长 50 |
 | createdAt | string | 创建时间，服务端生成，只读 |
 | updatedAt | string | 最后更新时间，服务端生成，只读 |
 
@@ -632,18 +645,18 @@ curl http://localhost:8080/api/health
 }
 ```
 
-### 4.2 部门字典
+### 4.2 部门名称字典
 
-返回当前所有未删除员工中出现过的部门（去重、升序），供前端部门下拉候选使用。
+返回当前所有未删除部门的名称（去重、升序），供前端员工表单部门下拉候选使用。
 
 | 项目 | 内容 |
 | --- | --- |
 | 请求方法 | `GET` |
-| 请求路径 | `/api/employees/meta/departments` |
+| 请求路径 | `/api/departments/meta/names` |
 | 认证 | 需要 Bearer Token |
 
 ```bash
-curl http://localhost:8080/api/employees/meta/departments \
+curl http://localhost:8080/api/departments/meta/names \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -655,6 +668,319 @@ curl http://localhost:8080/api/employees/meta/departments \
   "timestamp": 1758176700000
 }
 ```
+
+---
+
+## 五、部门管理接口
+
+### 5.1 部门新增
+
+录入部门基础信息，成功后返回完整部门对象（含服务端生成的 `id`、`createdAt`、`updatedAt`）。
+
+| 项目 | 内容 |
+| --- | --- |
+| 请求方法 | `POST` |
+| 请求路径 | `/api/departments` |
+| Content-Type | `application/json` |
+| 认证 | 需要 Bearer Token |
+
+**请求参数（Body）**
+
+| 参数 | 类型 | 必填 | 校验规则 |
+| --- | --- | --- | --- |
+| name | string | 是 | 非空，长度 ≤ 100，未删除记录内唯一 |
+| description | string | 否 | 长度 ≤ 200 |
+| manager | string | 否 | 长度 ≤ 50 |
+
+**请求示例**
+
+```bash
+curl -X POST http://localhost:8080/api/departments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{
+    "name": "研发部",
+    "description": "负责产品研发工作",
+    "manager": "张三"
+  }'
+```
+
+**成功响应** `200`
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": 1,
+    "name": "研发部",
+    "description": "负责产品研发工作",
+    "manager": "张三",
+    "createdAt": "2026-10-29 14:02:11",
+    "updatedAt": "2026-10-29 14:02:11"
+  },
+  "timestamp": 1761717731000
+}
+```
+
+**失败响应示例**
+
+部门名称重复（`409`）：
+
+```json
+{
+  "code": 409,
+  "message": "部门名称已存在",
+  "data": null,
+  "timestamp": 1761717740000
+}
+```
+
+参数校验失败（`400`）：
+
+```json
+{
+  "code": 400,
+  "message": "部门名称不能为空",
+  "data": null,
+  "timestamp": 1761717750000
+}
+```
+
+---
+
+### 5.2 部门列表查询
+
+查询未删除的部门列表，支持按部门名称模糊筛选，按 `createdAt` 倒序返回（最新新增在前）。
+
+| 项目 | 内容 |
+| --- | --- |
+| 请求方法 | `GET` |
+| 请求路径 | `/api/departments` |
+| 认证 | 需要 Bearer Token |
+
+**请求参数（Query）**
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| name | string | 否 | 部门名称，模糊匹配（`LIKE %name%`），空串视为不筛选 |
+
+**请求示例**
+
+```bash
+# 查询所有部门
+curl "http://localhost:8080/api/departments" \
+  -H "Authorization: Bearer <token>"
+
+# 按名称模糊筛选
+curl "http://localhost:8080/api/departments?name=研发" \
+  -H "Authorization: Bearer <token>"
+```
+
+**成功响应** `200`
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": [
+    {
+      "id": 1,
+      "name": "研发部",
+      "description": "负责产品研发工作",
+      "manager": "张三",
+      "createdAt": "2026-10-29 14:02:11",
+      "updatedAt": "2026-10-29 14:02:11"
+    }
+  ],
+  "timestamp": 1761717800000
+}
+```
+
+**边界行为**
+
+- 无匹配数据时返回 `[]`，仍返回 `200`。
+- 已软删除的部门不会出现在结果中。
+
+---
+
+### 5.3 部门详情查看
+
+按 id 查询单条部门的完整信息。
+
+| 项目 | 内容 |
+| --- | --- |
+| 请求方法 | `GET` |
+| 请求路径 | `/api/departments/{id}` |
+| 认证 | 需要 Bearer Token |
+
+**请求参数（Path）**
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| id | long | 是 | 部门主键 |
+
+**请求示例**
+
+```bash
+curl http://localhost:8080/api/departments/1 \
+  -H "Authorization: Bearer <token>"
+```
+
+**成功响应** `200`
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": 1,
+    "name": "研发部",
+    "description": "负责产品研发工作",
+    "manager": "张三",
+    "createdAt": "2026-10-29 14:02:11",
+    "updatedAt": "2026-10-29 14:02:11"
+  },
+  "timestamp": 1761717900000
+}
+```
+
+**失败响应** `404`（id 不存在，或该部门已被软删除）
+
+```json
+{
+  "code": 404,
+  "message": "部门不存在或已删除，id=999",
+  "data": null,
+  "timestamp": 1761717910000
+}
+```
+
+---
+
+### 5.4 部门信息编辑
+
+全量更新部门基础资料。
+
+| 项目 | 内容 |
+| --- | --- |
+| 请求方法 | `PUT` |
+| 请求路径 | `/api/departments/{id}` |
+| Content-Type | `application/json` |
+| 认证 | 需要 Bearer Token |
+
+**请求参数**
+
+| 参数 | 位置 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- | --- |
+| id | Path | long | 是 | 部门主键 |
+| name | Body | string | 是 | 校验规则同 5.1 |
+| description | Body | string | 否 | 校验规则同 5.1 |
+| manager | Body | string | 否 | 校验规则同 5.1 |
+
+**请求示例**
+
+```bash
+curl -X PUT http://localhost:8080/api/departments/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{
+    "name": "研发中心",
+    "description": "负责产品与技术研发",
+    "manager": "李四"
+  }'
+```
+
+**成功响应** `200`（返回更新后的完整对象，`updatedAt` 已刷新）
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": 1,
+    "name": "研发中心",
+    "description": "负责产品与技术研发",
+    "manager": "李四",
+    "createdAt": "2026-10-29 14:02:11",
+    "updatedAt": "2026-10-29 14:20:47"
+  },
+  "timestamp": 1761718847000
+}
+```
+
+**失败响应示例**
+
+部门不存在或已删除（`404`）：
+
+```json
+{
+  "code": 404,
+  "message": "部门不存在或已删除，id=999",
+  "data": null,
+  "timestamp": 1761718850000
+}
+```
+
+部门名称被他人占用（`409`）：
+
+```json
+{
+  "code": 409,
+  "message": "部门名称已存在",
+  "data": null,
+  "timestamp": 1761718860000
+}
+```
+
+---
+
+### 5.5 部门删除（软删除）
+
+逻辑删除，将 `deleted` 置为 1 并刷新 `updatedAt`，**数据行保留在数据库中不做物理删除**。删除后该部门不再出现在列表和详情中。
+
+| 项目 | 内容 |
+| --- | --- |
+| 请求方法 | `DELETE` |
+| 请求路径 | `/api/departments/{id}` |
+| 认证 | 需要 Bearer Token |
+
+**请求参数（Path）**
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| id | long | 是 | 部门主键 |
+
+**请求示例**
+
+```bash
+curl -X DELETE http://localhost:8080/api/departments/1 \
+  -H "Authorization: Bearer <token>"
+```
+
+**成功响应** `200`
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": null,
+  "timestamp": 1761718900000
+}
+```
+
+**失败响应** `404`（id 不存在，或已被删除后重复调用）
+
+```json
+{
+  "code": 404,
+  "message": "部门不存在或已删除，id=1",
+  "data": null,
+  "timestamp": 1761718910000
+}
+```
+
+> 幂等性说明：重复删除同一 id，第二次返回 `404`（而非静默成功），便于测试断言。
 
 ---
 
@@ -674,44 +1000,55 @@ curl http://localhost:8080/api/employees/meta/departments \
 
 ---
 
-## 六、数据库表结构
+## 七、数据库表结构
 
-数据库文件：`D:\hr-system\backend\data\hr.db`（SQLite，首次启动自动建表）
+数据库：MySQL 8.0（Docker 容器 `hr-mysql`）
 
 ```sql
 CREATE TABLE employee
 (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT    NOT NULL,           -- 姓名
-    phone      TEXT    NOT NULL,           -- 手机号
-    department TEXT    NOT NULL,           -- 部门
-    position   TEXT    NOT NULL,           -- 岗位
-    hire_date  TEXT    NOT NULL,           -- 入职时间 yyyy-MM-dd
-    status     TEXT    NOT NULL,           -- 在职 / 试用期 / 离职
-    deleted    INTEGER NOT NULL DEFAULT 0, -- 软删除标记：0 正常，1 已删除
-    created_at TEXT    NOT NULL,           -- 创建时间 yyyy-MM-dd HH:mm:ss
-    updated_at TEXT    NOT NULL            -- 更新时间 yyyy-MM-dd HH:mm:ss
-);
+    id         BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(50)  NOT NULL,
+    phone      VARCHAR(20)  NOT NULL,
+    department VARCHAR(50)  NOT NULL,
+    position   VARCHAR(50)  NOT NULL,
+    hire_date  DATE         NOT NULL,
+    status     VARCHAR(10)  NOT NULL,
+    deleted    TINYINT      NOT NULL DEFAULT 0,
+    created_at DATETIME     NOT NULL,
+    updated_at DATETIME     NOT NULL,
+    INDEX idx_employee_deleted (deleted),
+    INDEX idx_employee_name (name),
+    INDEX idx_employee_department (department),
+    INDEX idx_employee_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE INDEX idx_employee_deleted    ON employee (deleted);
-CREATE INDEX idx_employee_name       ON employee (name);
-CREATE INDEX idx_employee_department ON employee (department);
-
--- 仅对未删除记录生效的手机号唯一索引
-CREATE UNIQUE INDEX uk_employee_phone_active ON employee (phone) WHERE deleted = 0;
-
-CREATE TABLE IF NOT EXISTS sys_user
+CREATE TABLE sys_user
 (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT    NOT NULL UNIQUE,  -- 登录用户名
-    password_hash TEXT    NOT NULL,         -- PBKDF2-HMAC-SHA256 哈希值
-    salt          TEXT    NOT NULL,         -- 16 字节随机盐值（hex）
-    display_name  TEXT    NOT NULL,         -- 显示名称
-    enabled       INTEGER NOT NULL DEFAULT 1, -- 是否启用：1 启用，0 禁用
-    created_at    TEXT    NOT NULL,         -- 创建时间 yyyy-MM-dd HH:mm:ss
-    updated_at    TEXT    NOT NULL          -- 更新时间 yyyy-MM-dd HH:mm:ss
-);
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    username      VARCHAR(50)  NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    salt          VARCHAR(64)  NOT NULL,
+    display_name  VARCHAR(50)  NOT NULL,
+    enabled       TINYINT      NOT NULL DEFAULT 1,
+    created_at    DATETIME     NOT NULL,
+    updated_at    DATETIME     NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE department
+(
+    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(200) DEFAULT NULL,
+    manager     VARCHAR(50)  DEFAULT NULL,
+    deleted     TINYINT      NOT NULL DEFAULT 0,
+    created_at  DATETIME     NOT NULL,
+    updated_at  DATETIME     NOT NULL,
+    INDEX idx_dept_name (name),
+    INDEX idx_dept_deleted (deleted)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
 > 软删除记录可通过 SQL 直接查询历史数据：
 > `SELECT * FROM employee WHERE deleted = 1;`
+> `SELECT * FROM department WHERE deleted = 1;`
