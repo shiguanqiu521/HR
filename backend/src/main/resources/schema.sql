@@ -27,3 +27,16 @@ CREATE TABLE IF NOT EXISTS sys_user
     created_at    DATETIME     NOT NULL,
     updated_at    DATETIME     NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department
+(
+    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(200) DEFAULT NULL,
+    manager     VARCHAR(50)  DEFAULT NULL,
+    deleted     TINYINT      NOT NULL DEFAULT 0,
+    created_at  DATETIME     NOT NULL,
+    updated_at  DATETIME     NOT NULL,
+    INDEX idx_dept_name (name),
+    INDEX idx_dept_deleted (deleted)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

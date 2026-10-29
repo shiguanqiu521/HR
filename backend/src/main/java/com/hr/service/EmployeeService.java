@@ -5,8 +5,6 @@ import com.hr.common.PageResult;
 import com.hr.dto.EmployeeRequest;
 import com.hr.model.Employee;
 import com.hr.repository.EmployeeRepository;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -23,11 +21,11 @@ public class EmployeeService {
     private static final int MAX_PAGE_SIZE = 100;
 
     private final EmployeeRepository repository;
-    private final CacheManager cacheManager;
+    private final DepartmentService departmentService;
 
-    public EmployeeService(EmployeeRepository repository, CacheManager cacheManager) {
+    public EmployeeService(EmployeeRepository repository, DepartmentService departmentService) {
         this.repository = repository;
-        this.cacheManager = cacheManager;
+        this.departmentService = departmentService;
     }
 
     public Employee create(EmployeeRequest request) {
@@ -43,7 +41,6 @@ public class EmployeeService {
         employee.setUpdatedAt(now);
 
         long id = repository.insert(employee);
-        evictDepartmentsCache();
         return getDetail(id);
     }
 
@@ -59,7 +56,6 @@ public class EmployeeService {
         return new PageResult<>(list, total, page, size);
     }
 
-    @Cacheable(value = "employee", key = "#id")
     public Employee getDetail(long id) {
         return repository.findById(id)
                 .orElseThrow(() -> BizException.notFound("员工不存在或已被删除，id=" + id));
@@ -76,8 +72,6 @@ public class EmployeeService {
         applyRequest(existing, request);
         existing.setUpdatedAt(LocalDateTime.now().format(TIME_FORMATTER));
         repository.update(existing);
-        evictEmployeeCache(id);
-        evictDepartmentsCache();
         return getDetail(id);
     }
 
@@ -85,27 +79,10 @@ public class EmployeeService {
         repository.findById(id)
                 .orElseThrow(() -> BizException.notFound("员工不存在或已被删除，id=" + id));
         repository.softDelete(id, LocalDateTime.now().format(TIME_FORMATTER));
-        evictEmployeeCache(id);
-        evictDepartmentsCache();
     }
 
-    @Cacheable(value = "departments")
     public List<String> departments() {
-        return repository.findDepartments();
-    }
-
-    private void evictEmployeeCache(long id) {
-        var cache = cacheManager.getCache("employee");
-        if (cache != null) {
-            cache.evict(id);
-        }
-    }
-
-    private void evictDepartmentsCache() {
-        var cache = cacheManager.getCache("departments");
-        if (cache != null) {
-            cache.clear();
-        }
+        return departmentService.allNames();
     }
 
     private void validateStatus(String status) {

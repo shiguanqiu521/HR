@@ -103,7 +103,20 @@ const app = createApp({
         const loginLoading = ref(false);
         const loginForm = reactive({ username: '', password: '' });
 
+        const activeTab = ref('employee');
+
+        // 部门管理相关
+        const deptList = ref([]);
+        const deptLoading = ref(false);
+        const deptQuery = reactive({ name: '' });
+        const deptDialogVisible = ref(false);
+        const deptSubmitting = ref(false);
+        const deptFormRef = ref(null);
+        const editingDeptId = ref(null);
+        const deptForm = reactive({ name: '', description: '', manager: '' });
+
         const dialogTitle = computed(() => (editingId.value ? '编辑员工信息' : '新增员工'));
+        const deptDialogTitle = computed(() => (editingDeptId.value ? '编辑部门' : '新增部门'));
         const currentUserLabel = computed(() => {
             const u = auth.user;
             if (!u) return '';
@@ -128,6 +141,19 @@ const app = createApp({
             ],
             hireDate: [{ required: true, message: '请选择入职时间', trigger: 'change' }],
             status: [{ required: true, message: '请选择状态', trigger: 'change' }]
+        };
+
+        const deptRules = {
+            name: [
+                { required: true, message: '请输入部门名称', trigger: 'blur' },
+                { max: 100, message: '部门名称长度不能超过100个字符', trigger: 'blur' }
+            ],
+            manager: [
+                { max: 50, message: '负责人长度不能超过50个字符', trigger: 'blur' }
+            ],
+            description: [
+                { max: 200, message: '描述长度不能超过200个字符', trigger: 'blur' }
+            ]
         };
 
         const loginRules = {
@@ -158,7 +184,6 @@ const app = createApp({
                 list.value = data.list;
                 total.value = data.total;
                 apiOnline.value = true;
-                // 删除最后一页的唯一记录后，回退一页
                 if (data.list.length === 0 && data.total > 0 && query.page > 1) {
                     query.page = Math.max(1, Math.ceil(data.total / query.size));
                     return loadList();
@@ -173,7 +198,16 @@ const app = createApp({
 
         async function loadDepartments() {
             try {
-                departments.value = await request('/employees/meta/departments');
+                const params = deptQuery.name && deptQuery.name.trim() ? '?name=' + encodeURIComponent(deptQuery.name.trim()) : '';
+                deptList.value = await request('/departments' + params);
+            } catch (e) {
+                deptList.value = [];
+            }
+        }
+
+        async function loadDepartmentMeta() {
+            try {
+                departments.value = await request('/departments/meta/names');
             } catch (e) {
                 departments.value = [];
             }
@@ -273,7 +307,7 @@ const app = createApp({
                     query.page = 1;
                 }
                 dialogVisible.value = false;
-                await Promise.all([loadList(), loadDepartments()]);
+                await Promise.all([loadList(), loadDepartmentMeta()]);
             } catch (e) {
                 if (auth.token) ElMessage.error(e.message);
             } finally {
@@ -310,7 +344,90 @@ const app = createApp({
             try {
                 await request('/employees/' + row.id, { method: 'DELETE' });
                 ElMessage.success('删除成功');
-                await Promise.all([loadList(), loadDepartments()]);
+                await Promise.all([loadList(), loadDepartmentMeta()]);
+            } catch (e) {
+                if (auth.token) ElMessage.error(e.message);
+            }
+        }
+
+        // 部门管理方法
+        function openDeptCreate() {
+            editingDeptId.value = null;
+            deptForm.name = '';
+            deptForm.description = '';
+            deptForm.manager = '';
+            deptDialogVisible.value = true;
+        }
+
+        async function openDeptEdit(row) {
+            editingDeptId.value = row.id;
+            try {
+                const dept = await request('/departments/' + row.id);
+                deptForm.name = dept.name;
+                deptForm.description = dept.description || '';
+                deptForm.manager = dept.manager || '';
+            } catch (e) {
+                deptForm.name = row.name;
+                deptForm.description = row.description || '';
+                deptForm.manager = row.manager || '';
+            }
+            deptDialogVisible.value = true;
+        }
+
+        function handleDeptDialogClosed() {
+            editingDeptId.value = null;
+            if (deptFormRef.value) deptFormRef.value.clearValidate();
+            deptForm.name = '';
+            deptForm.description = '';
+            deptForm.manager = '';
+        }
+
+        async function handleDeptSubmit() {
+            if (!deptFormRef.value) return;
+            try {
+                await deptFormRef.value.validate();
+            } catch (e) {
+                return;
+            }
+
+            deptSubmitting.value = true;
+            const payload = {
+                name: deptForm.name.trim(),
+                description: deptForm.description.trim(),
+                manager: deptForm.manager.trim()
+            };
+            try {
+                if (editingDeptId.value) {
+                    await request('/departments/' + editingDeptId.value, { method: 'PUT', body: JSON.stringify(payload) });
+                    ElMessage.success('部门修改成功');
+                } else {
+                    await request('/departments', { method: 'POST', body: JSON.stringify(payload) });
+                    ElMessage.success('部门新增成功');
+                }
+                deptDialogVisible.value = false;
+                await loadDepartments();
+                await loadDepartmentMeta();
+            } catch (e) {
+                if (auth.token) ElMessage.error(e.message);
+            } finally {
+                deptSubmitting.value = false;
+            }
+        }
+
+        async function handleDeptDelete(row) {
+            try {
+                await ElMessageBox.confirm(
+                    '确认删除部门「' + row.name + '」吗？删除后该部门将从列表中移除。',
+                    '删除确认',
+                    { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
+                );
+            } catch (e) {
+                return;
+            }
+            try {
+                await request('/departments/' + row.id, { method: 'DELETE' });
+                ElMessage.success('部门删除成功');
+                await Promise.all([loadDepartments(), loadDepartmentMeta()]);
             } catch (e) {
                 if (auth.token) ElMessage.error(e.message);
             }
@@ -344,7 +461,7 @@ const app = createApp({
                 if (loginFormRef.value) loginFormRef.value.clearValidate();
                 ElMessage.success('登录成功，欢迎 ' + (data.displayName || data.username));
                 query.page = 1;
-                await Promise.all([loadList(), loadDepartments()]);
+                await Promise.all([loadList(), loadDepartmentMeta(), loadDepartments()]);
             } catch (e) {
                 ElMessage.error(e.message);
             } finally {
@@ -364,9 +481,11 @@ const app = createApp({
             list.value = [];
             total.value = 0;
             departments.value = [];
+            deptList.value = [];
             apiOnline.value = false;
             dialogVisible.value = false;
             detailVisible.value = false;
+            deptDialogVisible.value = false;
             ElMessage.success('已退出登录');
         }
 
@@ -376,9 +495,9 @@ const app = createApp({
                 auth.user = { userId: me.userId, username: me.username, displayName: me.displayName };
                 localStorage.setItem(USER_KEY, JSON.stringify(auth.user));
             } catch (e) {
-                if (!auth.token) return; // 令牌失效，forceLogout 已切回登录页
+                if (!auth.token) return;
             }
-            await Promise.all([loadList(), loadDepartments()]);
+            await Promise.all([loadList(), loadDepartmentMeta(), loadDepartments()]);
         }
 
         async function probeHealth() {
@@ -400,10 +519,14 @@ const app = createApp({
             dialogVisible, dialogTitle, submitting, formRef, form, rules, statusOptions: STATUS_OPTIONS,
             detailVisible, detailLoading, detail,
             loginFormRef, loginForm, loginRules, loginLoading, currentUserLabel,
+            activeTab,
+            deptList, deptLoading, deptQuery, deptDialogVisible, deptDialogTitle, deptSubmitting, deptFormRef, deptForm, deptRules,
             indexMethod, statusTagType,
             handleSearch, handleReset, handlePageChange, handleSizeChange,
             openCreate, openEdit, editFromDetail, handleDialogClosed, handleSubmit,
-            openDetail, handleDelete, handleLogin, handleLogout
+            openDetail, handleDelete,
+            openDeptCreate, openDeptEdit, handleDeptDialogClosed, handleDeptSubmit, handleDeptDelete,
+            handleLogin, handleLogout
         };
     }
 });

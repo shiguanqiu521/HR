@@ -79,69 +79,77 @@
         </header>
 
         <main class="app-main">
-            <el-card shadow="never" class="panel">
-                <el-form :inline="true" :model="query" class="search-form" @submit.prevent>
-                    <el-form-item label="姓名">
-                        <el-input v-model="query.name" placeholder="支持模糊查询" clearable
-                                  style="width: 200px" @keyup.enter="handleSearch" @clear="handleSearch"></el-input>
-                    </el-form-item>
-                    <el-form-item label="部门">
-                        <el-input v-model="query.department" placeholder="支持模糊查询" clearable
-                                  style="width: 200px" @keyup.enter="handleSearch" @clear="handleSearch"></el-input>
-                    </el-form-item>
-                    <el-form-item>
-                        <el-button type="primary" @click="handleSearch">
-                            <el-icon><search /></el-icon>&nbsp;查询
-                        </el-button>
-                        <el-button @click="handleReset">
-                            <el-icon><refresh /></el-icon>&nbsp;重置
-                        </el-button>
-                    </el-form-item>
-                </el-form>
+            <!-- 导航标签 -->
+            <el-tabs v-model="activeTab" type="border-card" class="nav-tabs">
+                <el-tab-pane label="员工管理" name="employee">
+                    <el-card shadow="never" class="panel">
+                        <el-form :inline="true" :model="query" class="search-form" @submit.prevent>
+                            <el-form-item label="姓名">
+                                <el-input v-model="query.name" placeholder="支持模糊查询" clearable style="width: 200px" @keyup.enter="handleSearch" @clear="handleSearch"></el-input>
+                            </el-form-item>
+                            <el-form-item label="部门">
+                                <el-input v-model="query.department" placeholder="支持模糊查询" clearable style="width: 200px" @keyup.enter="handleSearch" @clear="handleSearch"></el-input>
+                            </el-form-item>
+                            <el-form-item>
+                                <el-button type="primary" @click="handleSearch"><el-icon><search /></el-icon>&nbsp;查询</el-button>
+                                <el-button @click="handleReset"><el-icon><refresh /></el-icon>&nbsp;重置</el-button>
+                            </el-form-item>
+                        </el-form>
+                        <div class="toolbar">
+                            <el-button type="primary" @click="openCreate"><el-icon><plus /></el-icon>&nbsp;新增员工</el-button>
+                            <span class="total-tip">共 <b>{{ total }}</b> 条记录</span>
+                        </div>
+                        <el-table :data="list" v-loading="loading" border stripe empty-text="暂无员工数据">
+                            <el-table-column type="index" label="序号" width="70" align="center" :index="indexMethod"></el-table-column>
+                            <el-table-column prop="name" label="姓名" width="110" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="phone" label="手机号" width="140"></el-table-column>
+                            <el-table-column prop="department" label="部门" width="130" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="position" label="岗位" min-width="150" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="hireDate" label="入职时间" width="120" align="center"></el-table-column>
+                            <el-table-column prop="status" label="状态" width="100" align="center">
+                                <template #default="scope"><el-tag :type="statusTagType(scope.row.status)" size="small" effect="light">{{ scope.row.status }}</el-tag></template>
+                            </el-table-column>
+                            <el-table-column prop="updatedAt" label="更新时间" width="180" align="center"></el-table-column>
+                            <el-table-column label="操作" width="200" align="center" fixed="right">
+                                <template #default="scope">
+                                    <el-button link type="primary" size="small" @click="openDetail(scope.row)">详情</el-button>
+                                    <el-button link type="primary" size="small" @click="openEdit(scope.row)">编辑</el-button>
+                                    <el-button link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
+                                </template>
+                            </el-table-column>
+                        </el-table>
+                        <div class="pager">
+                            <el-pagination background layout="total, sizes, prev, pager, next, jumper" :total="total" :current-page="query.page" :page-size="query.size" :page-sizes="[5, 10, 20, 50]" @current-change="handlePageChange" @size-change="handleSizeChange"></el-pagination>
+                        </div>
+                    </el-card>
+                </el-tab-pane>
 
-                <div class="toolbar">
-                    <el-button type="primary" @click="openCreate">
-                        <el-icon><plus /></el-icon>&nbsp;新增员工
-                    </el-button>
-                    <span class="total-tip">共 <b>{{ total }}</b> 条记录</span>
-                </div>
-
-                <el-table :data="list" v-loading="loading" border stripe empty-text="暂无员工数据">
-                    <el-table-column type="index" label="序号" width="70" align="center" :index="indexMethod"></el-table-column>
-                    <el-table-column prop="name" label="姓名" width="110" show-overflow-tooltip></el-table-column>
-                    <el-table-column prop="phone" label="手机号" width="140"></el-table-column>
-                    <el-table-column prop="department" label="部门" width="130" show-overflow-tooltip></el-table-column>
-                    <el-table-column prop="position" label="岗位" min-width="150" show-overflow-tooltip></el-table-column>
-                    <el-table-column prop="hireDate" label="入职时间" width="120" align="center"></el-table-column>
-                    <el-table-column prop="status" label="状态" width="100" align="center">
-                        <template #default="scope">
-                            <el-tag :type="statusTagType(scope.row.status)" size="small" effect="light">
-                                {{ scope.row.status }}
-                            </el-tag>
-                        </template>
-                    </el-table-column>
-                    <el-table-column prop="updatedAt" label="更新时间" width="180" align="center"></el-table-column>
-                    <el-table-column label="操作" width="200" align="center" fixed="right">
-                        <template #default="scope">
-                            <el-button link type="primary" size="small" @click="openDetail(scope.row)">详情</el-button>
-                            <el-button link type="primary" size="small" @click="openEdit(scope.row)">编辑</el-button>
-                            <el-button link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
-                        </template>
-                    </el-table-column>
-                </el-table>
-
-                <div class="pager">
-                    <el-pagination background
-                                   layout="total, sizes, prev, pager, next, jumper"
-                                   :total="total"
-                                   :current-page="query.page"
-                                   :page-size="query.size"
-                                   :page-sizes="[5, 10, 20, 50]"
-                                   @current-change="handlePageChange"
-                                   @size-change="handleSizeChange">
-                    </el-pagination>
-                </div>
-            </el-card>
+                <!-- 部门管理 -->
+                <el-tab-pane label="部门管理" name="department">
+                    <el-card shadow="never" class="panel">
+                        <div class="dept-header">
+                            <el-input v-model="deptQuery.name" placeholder="搜索部门名称" clearable style="width: 300px" @keyup.enter="loadDepartments" @clear="loadDepartments">
+                                <template #prefix><el-icon><search /></el-icon></template>
+                            </el-input>
+                            <el-button type="primary" @click="openDeptCreate"><el-icon><plus /></el-icon>&nbsp;新增部门</el-button>
+                        </div>
+                        <el-table :data="deptList" v-loading="deptLoading" border stripe empty-text="暂无部门数据">
+                            <el-table-column type="index" label="序号" width="70" align="center"></el-table-column>
+                            <el-table-column prop="name" label="部门名称" min-width="150" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="manager" label="负责人" width="120" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip></el-table-column>
+                            <el-table-column prop="createdAt" label="创建时间" width="180" align="center"></el-table-column>
+                            <el-table-column label="操作" width="180" align="center" fixed="right">
+                                <template #default="scope">
+                                    <el-button link type="primary" size="small" @click="openDeptEdit(scope.row)">编辑</el-button>
+                                    <el-button link type="danger" size="small" @click="handleDeptDelete(scope.row)">删除</el-button>
+                                </template>
+                            </el-table-column>
+                        </el-table>
+                        <div class="total-tip" style="margin-top: 20px;">共 <b>{{ deptList.length }}</b> 个部门</div>
+                    </el-card>
+                </el-tab-pane>
+            </el-tabs>
         </main>
 
         <el-dialog v-model="dialogVisible" :title="dialogTitle" width="580px"
@@ -199,6 +207,27 @@
                 <el-button type="primary" @click="editFromDetail">编辑该员工</el-button>
             </template>
         </el-drawer>
+
+        <!-- 部门表单对话框 -->
+        <el-dialog v-model="deptDialogVisible" :title="deptDialogTitle" width="500px"
+                   :close-on-click-modal="false" @closed="handleDeptDialogClosed">
+            <el-form ref="deptFormRef" :model="deptForm" :rules="deptRules" label-width="90px">
+                <el-form-item label="部门名称" prop="name">
+                    <el-input v-model="deptForm.name" placeholder="请输入部门名称" maxlength="100" show-word-limit></el-input>
+                </el-form-item>
+                <el-form-item label="负责人" prop="manager">
+                    <el-input v-model="deptForm.manager" placeholder="请输入负责人姓名" maxlength="50"></el-input>
+                </el-form-item>
+                <el-form-item label="描述" prop="description">
+                    <el-input v-model="deptForm.description" type="textarea" :rows="3"
+                              placeholder="请输入部门描述" maxlength="200" show-word-limit></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="deptDialogVisible = false">取消</el-button>
+                <el-button type="primary" :loading="deptSubmitting" @click="handleDeptSubmit">确定</el-button>
+            </template>
+        </el-dialog>
     </template>
 </div>
 

@@ -234,3 +234,25 @@ body {
     font-style: normal;
     color: #c0c4cc;
 }
+
+/* ===== 导航标签 ===== */
+.nav-tabs {
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.nav-tabs .el-tabs__header {
+    margin: 0;
+}
+
+.nav-tabs .el-tabs__content {
+    padding: 20px;
+}
+
+/* ===== 部门管理 ===== */
+.dept-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
