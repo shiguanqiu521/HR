@@ -9,9 +9,9 @@ spring:
   application:
     name: hr-employee
   datasource:
-    url: jdbc:mysql://127.0.0.1:3306/hr_db?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
-    username: root
-    password: root
+    url: jdbc:mysql://${SPRING_DATASOURCE_HOST:127.0.0.1}:3306/${MYSQL_DATABASE:hr_db}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: ${SPRING_DATASOURCE_USERNAME:root}
+    password: ${SPRING_DATASOURCE_PASSWORD:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       pool-name: MysqlHikariPool
@@ -29,9 +29,9 @@ spring:
       schema-locations: classpath:schema.sql
   data:
     redis:
-      host: 127.0.0.1
-      port: 6379
-      password: ${REDIS_PASSWORD:}
+      host: ${SPRING_DATA_REDIS_HOST:127.0.0.1}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
       timeout: 5000ms
       lettuce:
         pool:
