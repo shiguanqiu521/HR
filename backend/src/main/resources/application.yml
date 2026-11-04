@@ -9,7 +9,7 @@ spring:
   application:
     name: hr-employee
   datasource:
-    url: jdbc:mysql://${SPRING_DATASOURCE_HOST:127.0.0.1}:3306/${MYSQL_DATABASE:hr_db}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    url: jdbc:mysql://${SPRING_DATASOURCE_HOST:127.0.0.1}:3306/${MYSQL_DATABASE:hr_db}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&connectTimeout=10000&socketTimeout=60000&autoReconnect=true&failOverReadOnly=false
     username: ${SPRING_DATASOURCE_USERNAME:root}
     password: ${SPRING_DATASOURCE_PASSWORD:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -18,10 +18,11 @@ spring:
       maximum-pool-size: 5
       minimum-idle: 2
       connection-timeout: 30000
-      max-lifetime: 1800000
-      idle-timeout: 600000
-      keepalive-time: 300000
+      max-lifetime: 900000
+      idle-timeout: 300000
+      keepalive-time: 120000
       connection-test-query: SELECT 1
+      leak-detection-threshold: 60000
   sql:
     init:
       mode: always
