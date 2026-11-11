@@ -28,7 +28,23 @@ docker/redis/data/
 
 # Environment
 .env
+.env.*
 *.env.local
+!tests/config/.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Allure
+reports/allure-results/
+reports/allure-report/
+allure-results/
+
+# Reports
+reports/report_*.html
 
 # Data
 backend/data/

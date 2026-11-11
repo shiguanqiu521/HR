@@ -1,0 +1,110 @@
+# 员工模块测试数据
+
+create_success:
+  name: "张三"
+  phone: "13800138000"
+  department: "研发部"
+  position: "测试工程师"
+  hireDate: "2026-03-01"
+  status: "在职"
+
+create_status_values:
+  - "在职"
+  - "试用期"
+  - "离职"
+
+create_fail_cases:
+  - case_name: "name为空"
+    field: "name"
+    value: ""
+    expected_code: 400
+    message_contains: "姓名"
+
+  - case_name: "phone为空"
+    field: "phone"
+    value: ""
+    expected_code: 400
+    message_contains: "手机"
+
+  - case_name: "phone非11位"
+    field: "phone"
+    value: "12345"
+    expected_code: 400
+    message_contains: "手机"
+
+  - case_name: "phone含字母"
+    field: "phone"
+    value: "138abcd0000"
+    expected_code: 400
+    message_contains: "手机"
+
+  - case_name: "department为空"
+    field: "department"
+    value: ""
+    expected_code: 400
+    message_contains: "部门"
+
+  - case_name: "position为空"
+    field: "position"
+    value: ""
+    expected_code: 400
+    message_contains: "岗位"
+
+  - case_name: "hireDate为空"
+    field: "hireDate"
+    value: ""
+    expected_code: 400
+
+  - case_name: "hireDate格式错误"
+    field: "hireDate"
+    value: "2026/11/01"
+    expected_code: 400
+
+  - case_name: "status非法值"
+    field: "status"
+    value: "未知"
+    expected_code: 400
+
+create_boundary_cases:
+  - case_name: "name恰好50字符"
+    field: "name"
+    value_length: 50
+    expected_code: 200
+
+  - case_name: "name超50字符"
+    field: "name"
+    value_length: 51
+    expected_code: 400
+
+  - case_name: "phone非1开头"
+    field: "phone"
+    value: "23800138000"
+    expected_code: 400
+
+  - case_name: "department恰好50字符"
+    field: "department"
+    value_length: 50
+    expected_code: 200
+
+  - case_name: "department超50字符"
+    field: "department"
+    value_length: 51
+    expected_code: 400
+
+list_pagination_cases:
+  - case_name: "默认分页"
+    params: {page: 1, size: 10}
+    expected_code: 200
+
+  - case_name: "page小于1"
+    params: {page: 0, size: 10}
+    expected_code: 400
+
+  - case_name: "size超过100"
+    params: {page: 1, size: 101}
+    expected_code: 400
+    message_contains: "size"
+
+  - case_name: "size小于1"
+    params: {page: 1, size: 0}
+    expected_code: 400

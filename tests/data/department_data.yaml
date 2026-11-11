@@ -1,0 +1,32 @@
+# 部门模块测试数据
+
+create_success:
+  name: "研发部"
+  description: "负责产品研发工作"
+  manager: "张三"
+
+create_only_required:
+  name: "测试部"
+
+create_fail_cases:
+  - case_name: "name为空"
+    field: "name"
+    value: ""
+    expected_code: 400
+    message_contains: "部门名称"
+
+create_boundary_cases:
+  - case_name: "name恰好100字符"
+    field: "name"
+    value_length: 100
+    expected_code: 200
+
+  - case_name: "name超100字符"
+    field: "name"
+    value_length: 101
+    expected_code: 400
+
+  - case_name: "description超200字符"
+    field: "description"
+    value_length: 201
+    expected_code: 400
