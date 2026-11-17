@@ -1,0 +1,19 @@
+# 覆盖率采集开关（opt-in overlay）
+#
+# 用法（只在开发/测试环境按需启用，不改变 docker-compose.yml 的默认行为）：
+#   docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+# 用完恢复原状：
+#   docker compose -f docker-compose.yml up -d backend
+#
+# backend 镜像里预置了 /opt/jacoco/jacocoagent.jar，但不设置 JAVA_TOOL_OPTIONS 时
+# agent 不会挂载。本文件只做两件事：挂 agent + 把 tcpserver 端口发布到宿主机。
+#
+# 默认只绑宿主机回环（127.0.0.1:6300），公网无法访问；需要远程采集时在服务器
+# .env 中设置 JACOCO_DUMP_BIND=0.0.0.0，并由云安全组把 6300 限制到指定来源 IP。
+services:
+  backend:
+    environment:
+      # temurin 镜像的 java 启动器识别 JAVA_TOOL_OPTIONS，无需改 ENTRYPOINT
+      JAVA_TOOL_OPTIONS: "-javaagent:/opt/jacoco/jacocoagent.jar=output=tcpserver,address=0.0.0.0,port=6300,append=false,includes=com.hr.*"
+    ports:
+      - "${JACOCO_DUMP_BIND:-127.0.0.1}:6300:6300"

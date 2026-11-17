@@ -9,6 +9,7 @@ tests/
 ├── config/                 # 配置层
 │   ├── __init__.py
 │   ├── settings.py         # 环境配置代理（dev/test/prod 运行时切换）
+│   ├── coverage.yml        # 覆盖率归因与门禁配置（统计范围、阈值、tcpserver 地址）
 │   ├── .env.example        # 配置模板（可提交，不含真实密钥）
 │   ├── .env.dev            # 开发环境配置（已被 .gitignore 忽略）
 │   ├── .env.test           # 测试环境配置（同上）
@@ -49,9 +50,10 @@ tests/
 │   │   └── test_department.py  # 部门模块：24 个用例函数 / 30 个 item
 │   └── ui/                 # UI 测试用例（预留，当前无用例）
 │
-├── reports/                # 测试报告输出（allure-results/、allure-report/、report_*.html）
+├── reports/                # 测试报告输出（allure-results/、allure-report/、report_*.html、coverage/）
 ├── logs/                   # 日志文件输出
 ├── run.py                  # 统一测试执行入口（推荐）
+├── coverage_gate.py        # 覆盖率归因与门禁（统计后端代码，非测试脚本）
 ├── pytest.ini              # pytest 配置（testpaths、allure 输出目录、markers）
 ├── requirements.txt        # 依赖
 └── README.md               # 本文件
@@ -141,6 +143,61 @@ export HR_JWT_SECRET=
 > `.env.dev` / `.env.test` / `.env.prod` 已被 `.gitignore` 忽略，仓库中只保留 `.env.example` 模板；
 > 真实密钥请在目标机器上就地填写，不提交、不写入用例代码。
 
+## 覆盖率归因与门禁
+
+统计的是**接口用例执行期间后端源码（`backend/src/main/java`）被覆盖的行与分支**，不是测试脚本自身。
+后端单元测试目录 `backend/src/test` 为空，所以在接入这一段之前，"接口测试到底覆盖了多少后端代码"完全无法回答。
+
+**原理**：后端 JVM 以 JaCoCo agent 的 `tcpserver` 模式运行 → 本地清零计数器 → 跑接口用例 → dump 取回执行数据 →
+用 `jacoco:report` 对齐 `backend/target/classes` 出报告 → 按包归因并按阈值判定。
+agent 只在容器设置了 `JAVA_TOOL_OPTIONS` 时挂载，镜像里预置 jar 但默认不生效，因此对正常部署无影响。
+
+**一次性准备（服务器，需重启后端容器）**
+```bash
+cd /opt/hr-system
+git pull origin main
+docker compose build backend                                   # 镜像内加入 jacocoagent.jar
+# 合并后的编排必须同时保留 8080 和新增的 6300，先校验再启动
+docker compose -f docker-compose.yml -f docker-compose.coverage.yml config \
+    | grep -E "target:|published:"
+docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+```
+
+**采集通道**：overlay 默认把 tcpserver 只绑到服务器回环（`127.0.0.1:6300`），公网不可达。二选一
+```bash
+# 方式一（推荐）：本地建 SSH 隧道，配置保持 host: 127.0.0.1
+ssh -N -L 6300:127.0.0.1:6300 <user>@<server>
+
+# 方式二：直连，需在服务器 .env 设置 JACOCO_DUMP_BIND=0.0.0.0，
+# 并由云安全组把 6300 限制到指定来源 IP；用 --dump-host 指定服务器地址
+```
+
+**每轮执行（本地）**
+```bash
+cd D:\hr-system\tests
+.venv\Scripts\python.exe coverage_gate.py                       # 清零 + 全量接口用例 + 归因 + 门禁
+.venv\Scripts\python.exe coverage_gate.py -k department         # 只跑部分用例，看这块用例集贡献了多少覆盖
+.venv\Scripts\python.exe coverage_gate.py --check-only           # 不跑用例，取当前累计数据
+.venv\Scripts\python.exe coverage_gate.py --update-thresholds    # 用实测值固化门禁下限（棘轮）
+```
+
+**输出**
+- 终端：按包的行/分支/方法覆盖率表 + 合计 + 门禁判定，未达标退出码 1（可直接接 CI）
+- `reports/coverage/<时间戳>/index.html`：JaCoCo 原生报告，可下钻到行号看未覆盖代码
+- `reports/coverage/latest/`：指向最新一轮；`reports/coverage/summary.json`：机器可读，供后续 CI 阶段消费
+
+**门禁口径**
+- `config/coverage.yml` 的 `package_prefix` 决定统计范围（默认 `com.hr.`），`exclude_packages` 可把纯数据/配置包移出门禁；
+  首轮实测确认口径后再填，不要凭感觉排除。
+- `thresholds.line/branch` 为 `null` 时只测量不判定；核对后 `--update-thresholds` 写入下限（向下取整）。
+  阈值只升不降：回退必须显式改配置并在评审中说明原因。
+- 用例存在 failed 时本轮覆盖率**不作为质量结论**（脚本会在判定后提示），先按「失败归因先于改用例」处理。
+- 计数在采集前清零，所以只有**接口用例驱动的执行**计入覆盖；仅在应用启动阶段跑一次的代码
+  （`@PostConstruct`、建表初始化等）会显示为未覆盖，属口径设定而非缺陷。
+- 报告按 class id 对齐字节码：本地 `backend/target/classes` 与服务器运行的不是同一 commit 时，
+  覆盖数据会被 JaCoCo 静默丢弃并显示 0 覆盖。本地先 `git pull`，再带 `--build` 采集。
+- coverage overlay 只用于 dev/test；生产环境不启用，也不要把 6300 开放到公网。
+
 ## 分层说明
 
 | 层级 | 目录 | 职责 |
@@ -201,4 +258,5 @@ export HR_JWT_SECRET=
 - **多环境支持**：`--env` 参数或 `HR_ENV` 环境变量切换 dev/test/prod，运行时生效
 - **配置与密钥分离**：`.env.*` 不入库，仓库只保留 `.env.example`
 - **Allure + HTML 双报告**：失败用例附带请求响应现场
+- **覆盖率归因与门禁**：接口用例驱动后端 JaCoCo agent，按包统计被测系统的行/分支覆盖，阈值棘轮只升不降
 - **分层架构**：接口封装、数据、断言、用例分离，可跨项目复用同一套骨架

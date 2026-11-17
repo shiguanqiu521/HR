@@ -49,7 +49,14 @@ D:\hr-system\
 │   └── deploy.sh                服务器部署脚本
 ├── .github\workflows\ci-cd.yml  GitHub Actions CI/CD 工作流
 ├── docker-compose.yml           Docker Compose 编排文件
-── .env                         环境变量（密码等敏感配置，不提交 git）
+├── docker-compose.coverage.yml  覆盖率采集 overlay（按需启用，不改变默认编排）
+├── tests\                       接口自动化测试工程（分层框架 + 用例 + 覆盖率门禁）
+│   ├── README.md                框架说明、运行方式、用例编写约定
+│   ├── testcases\api\           认证 / 员工 / 部门接口用例
+│   └── coverage_gate.py         后端代码覆盖率归因与门禁入口
+├── HR系统测试用例.xlsx           测试用例表（功能/性能/安全）
+├── 接口测试用例设计评审与修改清单.md  五大设计方法的评审结论与逐条修改依据
+├── .env                         环境变量（密码等敏感配置，不提交 git）
 ├── .env.example                 环境变量示例
 ├── .gitignore
 ├── API.md                       接口文档
@@ -171,12 +178,23 @@ docker-compose down
 | 令牌有效期 | 720 分钟（12 小时） | `application.yml` → `hr.auth.token-ttl-minutes` |
 | 默认用户名 | `admin` | `application.yml` → `hr.auth.default-username` |
 | 默认密码 | `admin123` | `application.yml` → `hr.auth.default-password` |
+| 覆盖率采集端口 | 6300（仅启用 coverage overlay 时存在，默认只绑服务器 127.0.0.1） | `docker-compose.coverage.yml` |
 
 > **安全提示**：生产环境务必修改 `.env` 中的密码和 JWT 密钥。密码在数据库中以 PBKDF2-HMAC-SHA256 哈希存储，不会明文落库。`.env` 文件已在 `.gitignore` 中，不会被提交到 git。
 
 ## 接口文档
 
 完整接口文档见 **[API.md](./API.md)**，包含认证机制（JWT 令牌）、统一响应结构、状态码约定、字段校验规则、每个接口的请求/响应示例与边界行为说明。
+
+## 接口自动化测试
+
+`tests/` 是基于 pytest 的分层接口自动化工程，覆盖认证、员工、部门三个模块；
+用例清单见 **HR系统测试用例.xlsx**，五大设计方法（等价类划分、边界值分析、判定表、场景法、错误推测法）的
+映射与逐条修改依据见 **接口测试用例设计评审与修改清单.md**；
+运行方式、用例编写约定、覆盖率门禁见 **[tests/README.md](./tests/README.md)**。
+
+> `backend/src/test` 目前为空，CI 中的 `mvn clean verify` 不执行任何单元测试，
+> 后端代码覆盖率只能由 `tests/coverage_gate.py` 通过 JaCoCo agent 归因到接口用例。
 
 ## CI/CD 部署
 

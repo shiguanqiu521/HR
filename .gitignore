@@ -46,5 +46,12 @@ allure-results/
 # Reports
 reports/report_*.html
 
+# 测试执行产物（HTML 报告含请求/响应明文，可能带账号密码，禁止入库）
+tests/reports/
+tests/logs/
+
+# 覆盖率归因产物
+*.exec
+
 # Data
 backend/data/
