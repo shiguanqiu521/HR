@@ -6,18 +6,19 @@ services:
     container_name: hr-mysql
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须在 .env 中设置，不允许使用默认弱口令}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-hr_db}
       MYSQL_CHARACTER_SET_SERVER: utf8mb4
       MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
     ports:
-      - "3306:3306"
+      # 只绑回环：容器间走 hr_default 网络互访，公网无需直连数据库
+      - "127.0.0.1:3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
       - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
     command: --default-authentication-plugin=mysql_native_password --innodb-buffer-pool-size=256M --innodb-log-buffer-size=32M
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -26,13 +27,14 @@ services:
     image: redis:7-alpine
     container_name: hr-redis
     restart: always
-    command: redis-server --requirepass ${REDIS_PASSWORD:-}
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD 必须在 .env 中设置，不允许无密码运行}
     ports:
-      - "6379:6379"
+      # 只绑回环：Redis 无公网直连需求，暴露到 0.0.0.0 会被扫描器直接命中
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,11 +51,11 @@ services:
       SPRING_DATASOURCE_HOST: mysql
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-hr_db}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
       SPRING_DATASOURCE_USERNAME: root
-      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
-      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      HR_AUTH_JWT_SECRET: ${HR_AUTH_JWT_SECRET:-hr-employee-jwt-secret-key-change-me-in-production-2026}
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      HR_AUTH_JWT_SECRET: ${HR_AUTH_JWT_SECRET:?HR_AUTH_JWT_SECRET 必须在 .env 中设置，仓库里印着的默认值等于公开}
     depends_on:
       mysql:
         condition: service_healthy

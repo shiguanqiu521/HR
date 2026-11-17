@@ -376,9 +376,9 @@ def main():
         dump_execution_data(cfg, host, port, exec_file)
     except Exception as exc:
         print(f"清零失败：{exc}")
-        print("请确认后端已用 docker-compose.coverage.yml 启动，且端口可达：\n"
-              "  docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend\n"
-              "  远端部署时先建隧道：ssh -N -L 6300:127.0.0.1:6300 <user>@<server>")
+        print("请确认后端已用 coverage overlay 启动，且端口可达（服务器只有 docker-compose 1.29.2）：\n"
+              "  docker-compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend\n"
+              "  远端部署时先建隧道：ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134")
         return 2
 
     pytest_exit = 0

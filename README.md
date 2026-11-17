@@ -169,18 +169,20 @@ docker-compose down
 | --- | --- | --- |
 | 后端端口 | 8080 | `docker-compose.yml` → `backend.ports` |
 | 前端端口 | 80 | `docker-compose.yml` → `frontend.ports` |
-| MySQL 端口 | 3306 | `docker-compose.yml` → `mysql.ports` |
-| Redis 端口 | 6379 | `docker-compose.yml` → `redis.ports` |
+| MySQL 端口 | 3306，**只绑 127.0.0.1**（容器间走 `hr_default` 网络，公网不可直连） | `docker-compose.yml` → `mysql.ports` |
+| Redis 端口 | 6379，**只绑 127.0.0.1** | `docker-compose.yml` → `redis.ports` |
 | 数据库名 | `hr_db` | `.env` → `MYSQL_DATABASE` |
-| MySQL 密码 | `root` | `.env` → `MYSQL_ROOT_PASSWORD` |
-| Redis 密码 | 无 | `.env` → `REDIS_PASSWORD` |
-| JWT 密钥 | `hr-employee-jwt-secret-key-change-me-in-production-2026` | `.env` → `HR_AUTH_JWT_SECRET` |
+| MySQL 密码 | 无默认值，**必填**（留空启动即失败） | `.env` → `MYSQL_ROOT_PASSWORD` |
+| Redis 密码 | 无默认值，**必填** | `.env` → `REDIS_PASSWORD` |
+| JWT 密钥 | 无默认值，**必填** | `.env` → `HR_AUTH_JWT_SECRET` |
 | 令牌有效期 | 720 分钟（12 小时） | `application.yml` → `hr.auth.token-ttl-minutes` |
 | 默认用户名 | `admin` | `application.yml` → `hr.auth.default-username` |
 | 默认密码 | `admin123` | `application.yml` → `hr.auth.default-password` |
 | 覆盖率采集端口 | 6300（仅启用 coverage overlay 时存在，默认只绑服务器 127.0.0.1） | `docker-compose.coverage.yml` |
 
-> **安全提示**：生产环境务必修改 `.env` 中的密码和 JWT 密钥。密码在数据库中以 PBKDF2-HMAC-SHA256 哈希存储，不会明文落库。`.env` 文件已在 `.gitignore` 中，不会被提交到 git。
+> **安全提示**：`.env` 中的三个口令类配置（`MYSQL_ROOT_PASSWORD` / `REDIS_PASSWORD` / `HR_AUTH_JWT_SECRET`）在 `docker-compose.yml` 里已改为 `${VAR:?}` 必填形式——留空或缺少 `.env` 会让 `docker compose up` 直接报错，而不是悄悄用弱默认值启动。用户密码在数据库中以 PBKDF2-HMAC-SHA256 哈希存储，不会明文落库。`.env` 已在 `.gitignore` 中，不会被提交到 git。
+>
+> **关于端口暴露**：Docker 为容器发布端口时写入的 iptables 规则会**绕过宿主机的 ufw**，所以在服务器上执行 `ufw deny 3306` 对 `ports: - "3306:3306"` 是无效的。真正有效的做法只有两种：把绑定地址写成 `127.0.0.1:`（本项目对 MySQL/Redis 已这样做），或在云厂商安全组里限制入站来源。`backend` 的 8080 与 `frontend` 的 80 仍对外发布，若不需要公网访问，请在安全组中限定来源 IP。
 
 ## 接口文档
 

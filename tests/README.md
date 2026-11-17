@@ -153,23 +153,34 @@ export HR_JWT_SECRET=
 agent 只在容器设置了 `JAVA_TOOL_OPTIONS` 时挂载，镜像里预置 jar 但默认不生效，因此对正常部署无影响。
 
 **一次性准备（服务器，需重启后端容器）**
+
+dev 服务器实况：仓库在 `/root/HR`，分支只有 `master`，只有 `docker-compose` 1.29.2（无 compose v2 插件），
+登录用户 `root`。命令统一按这个环境写，不要混用 `docker compose`。
+
 ```bash
-cd /opt/hr-system
-git pull origin main
-docker compose build backend                                   # 镜像内加入 jacocoagent.jar
-# 合并后的编排必须同时保留 8080 和新增的 6300，先校验再启动
-docker compose -f docker-compose.yml -f docker-compose.coverage.yml config \
-    | grep -E "target:|published:"
-docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+cd /root/HR
+git pull origin master
+docker-compose build backend                    # 镜像内加入 jacocoagent.jar，耗时比平时多几秒
+docker-compose -f docker-compose.yml -f docker-compose.coverage.yml config \
+    | sed -n '/backend:/,/frontend:/p'         # 校验：JAVA_TOOL_OPTIONS 与 6300 都要出现，且 8080 仍在
+docker-compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+docker logs --tail 50 hr-backend | grep -i "JAVA_TOOL_OPTIONS\|jacoco\|Started HrApplication"
 ```
+最后一条必须打印 `Picked up JAVA_TOOL_OPTIONS: -javaagent:/opt/jacoco/jacocoagent.jar=...`，
+没有就说明 agent 没挂上，先别采集。用完恢复：
+`docker-compose -f docker-compose.yml up -d backend`。
+
+> 已知不一致（待单独修正，不影响本流程）：`docker/deploy.sh` 与 `.github/workflows/ci-cd.yml`
+> 里写的是 `/opt/hr-system`、`git pull origin main`、`docker compose`，与实际服务器的
+> `/root/HR`、`master`、`docker-compose` 三项都不符，因此 CI 的部署阶段在这台机器上跑不通。
 
 **采集通道**：overlay 默认把 tcpserver 只绑到服务器回环（`127.0.0.1:6300`），公网不可达。二选一
 ```bash
-# 方式一（推荐）：本地建 SSH 隧道，配置保持 host: 127.0.0.1
-ssh -N -L 6300:127.0.0.1:6300 <user>@<server>
+# 方式一（推荐）：本地另开窗口常驻 SSH 隧道，配置保持 host: 127.0.0.1
+ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134
 
-# 方式二：直连，需在服务器 .env 设置 JACOCO_DUMP_BIND=0.0.0.0，
-# 并由云安全组把 6300 限制到指定来源 IP；用 --dump-host 指定服务器地址
+# 方式二：直连，需在服务器 /root/HR/.env 设置 JACOCO_DUMP_BIND=0.0.0.0 后重新 up -d，
+# 并由云安全组把 6300 限制到指定来源 IP；采集时加 --dump-host 106.12.144.134
 ```
 
 **每轮执行（本地）**
