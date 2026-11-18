@@ -435,7 +435,10 @@ def evaluate_gate(cfg, totals):
 
 
 def update_thresholds(cfg, totals):
-    """把本轮实测覆盖率写回配置作为门禁下限（向下取整，形成只升不降的棘轮）
+    """把本轮实测覆盖率写回配置作为门禁下限（向下取整，只升不降）
+
+    只替换数值本身：行内注释记的是"这个下限由哪一轮实测得出"，被冲掉就失去了复核依据。
+    实测低于现有下限时不写回——棘轮只允许被更好的覆盖率抬升，否则一次失败轮就会把下限悄悄拉低。
 
     Args:
         cfg: 配置字典
@@ -448,11 +451,19 @@ def update_thresholds(cfg, totals):
         value = totals[metric]["percent"]
         if value is None:
             continue
-        new_value = int(value)
-        text = re.sub(rf"^(\s+{metric}: )(.*)$", rf"\g<1>{new_value}", text, count=1, flags=re.M)
+        match = re.search(rf"^([ \t]+{metric}: )(\d+)(.*)$", text, flags=re.M)
+        if not match:
+            print(f"警告：配置中找不到 thresholds.{metric}，该项未写回")
+            continue
+        current, new_value = int(match.group(2)), int(value)
+        if new_value <= current:
+            print(f"  {metric}: 实测 {value:.2f}% 取整 {new_value}，未超过现有下限 {current}，保持不变")
+            continue
+        text = text[:match.start()] + f"{match.group(1)}{new_value}{match.group(3)}" + text[match.end():]
+        print(f"  {metric}: 下限 {current} → {new_value}（本轮实测 {value:.2f}%）")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
-    print(f"已把门禁阈值写回 {path}（向下取整，请复核后再提交）")
+    print(f"已处理门禁阈值 {path}（请复核行内注释里的轮次来源后再提交）")
 
 
 def setup_stdout():

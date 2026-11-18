@@ -69,6 +69,7 @@ tests/
 | dev 实测（2026-11-10） | 21 | 72 | 30 | **123 passed / 0 failed / 1 skipped**，26.0s |
 | dev 实测（2026-11-17，覆盖率门禁同轮） | 22 | 72 | 30 | **124 passed / 0 failed / 0 skipped**，22.91s |
 | dev 实测（2026-11-18 上午，补 4 条 `TC-META-*` 后同轮） | 22 | 76 | 30 | **128 passed / 0 failed / 0 skipped**，23.46s（该 4 条已于同日接口收敛时删除） |
+| dev 实测（2026-11-18 下午，接口收敛后重建部署、覆盖率门禁同轮） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，26.15s |
 
 - 用例表：`../HR系统测试用例.xlsx`（功能测试 121 行 = 93 有效 + 19 已删除标注行；有效用例变更类型分布 修改 48 / 新增 16 / 不变 29），逐条变更记录见「用例变更记录」sheet（95 条）。
 - `TC-AUTH-014`（过期 token 本地自签）已在 `config/.env.dev` 填入与服务端一致的 `HR_JWT_SECRET` 后转执行，2026-11-17 实测通过，无 skipped。
@@ -168,10 +169,14 @@ cd /root/HR
 git pull origin master
 docker compose build backend                    # 镜像内加入 jacocoagent.jar，耗时比平时多几秒
 docker compose -f docker-compose.yml -f docker-compose.coverage.yml config \
-    | sed -n '/backend:/,/frontend:/p'         # 校验：JAVA_TOOL_OPTIONS 与 6300 都要出现，且 8080 仍在
+    | grep -nE "JAVA_TOOL_OPTIONS|host_ip|published"
 docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
 docker logs --tail 50 hr-backend | grep -i "JAVA_TOOL_OPTIONS\|jacoco\|Started HrApplication"
 ```
+校验那条只 grep 要确认的三类行：`JAVA_TOOL_OPTIONS` 出现、6300 上方带 `host_ip: 127.0.0.1`、8080 仍在。
+**不要**图省事用 `sed -n '/backend:/,/frontend:/p'` 打印整段 service 块——`docker compose config` 输出的是
+解析后的最终值，backend 的 `environment` 里含 `SPRING_DATASOURCE_PASSWORD`、`SPRING_DATA_REDIS_PASSWORD`、
+`HR_AUTH_JWT_SECRET`，整段打印等于把三个明文密钥打到屏幕上（还会进 shell 历史与任何录屏）。
 最后一条必须打印 `Picked up JAVA_TOOL_OPTIONS: -javaagent:/opt/jacoco/jacocoagent.jar=...`，
 没有就说明 agent 没挂上，先别采集。用完恢复：
 `docker compose -f docker-compose.yml up -d backend`。
@@ -220,6 +225,17 @@ cd D:\hr-system\tests
   **向下取整本身就是回退余量**：实测 69.91% 固化成 69，等于给 4 行以内的波动留了缓冲。
   所以"要不要把阈值上调到小数位"不是一个需要人工拍的决定——棘轮对同一轮实测是幂等的（`int(69.91) == 69`），
   跑一轮再执行 `--update-thresholds` 得到什么就是什么，只有跨整数上升才改变阈值。
+  余量随基数变化，不要把它当固定额度：458 行时 1 行就是 0.22pp，实测 70.09% 取整成 70 只剩 0.09pp（不足 1 行）。
+  这一档可用是因为同一 JVM 的稳态轮逐行完全可复现（见下节实测），真正的风险只剩"少覆盖一行"这一类信号，
+  而那正是门禁要报的东西。
+  "只升不降"和"保留复核依据"现在由 `update_thresholds()` 代码保证，不再靠口头约定：实测取整后不高于现有下限时
+  原样保留并打印说明（否则一次失败轮就会把下限悄悄拉低）；写回时只替换数值本身，行内注释留着记"这个下限由哪一轮得出"。
+- **容器重启后的首轮比稳态轮高 1 行，阈值只认稳态轮**：清零协议清的是计数器，不是类加载状态。
+  `PasswordHasher` 的静态字段初始化（`private static final SecureRandom RANDOM = new SecureRandom();`）
+  在整个 JVM 生命周期里只执行一次——重启后第一次登录若落在测量窗口内，这行记为已覆盖，之后每一轮都记为未覆盖。
+  2026-11-18 同一部署、同一用例集实测：重启后首轮 322/458=70.31%，其后各轮稳定 321/458=70.09%，方法数同步差 1
+  （`<clinit>` 本身算一个方法）。这是 `com.hr.config` 整包 0% 那条口径的镜像，不是用例不稳定。
+  固化阈值前先在目标 JVM 上跑一轮丢弃，或直接把首轮读高 1 行计入理解。
 - 用例存在 failed 时本轮覆盖率**不作为质量结论**（脚本会在判定后提示），先按「失败归因先于改用例」处理。
 - 计数在采集前清零，所以只有**接口用例驱动的执行**计入覆盖；仅在应用启动阶段跑一次的代码
   （`@PostConstruct`、建表初始化、`@Bean` 装配、各层构造器）会显示为未覆盖，属口径设定而非缺陷。
@@ -247,19 +263,30 @@ cd D:\hr-system\tests
   两者的数字都不作为覆盖率结论。
 - coverage overlay 只用于 dev/test；生产环境不启用，也不要把 6300 开放到公网。
 
-**干净单轮实测（2026-11-18 上午，128 passed 同轮，字节码来源 = 部署容器，连跑两轮完全一致）**
+**干净单轮实测（2026-11-18 下午，接口收敛并重建部署后，125 passed 同轮，字节码来源 = 部署容器）**
 
-下表为接口收敛前（`/api/employees/meta/departments` 仍在代码里时）的口径。
-
-| 口径 | 实测 | 门禁下限 | 说明 |
+| 口径 | 实测（稳态轮） | 门禁下限 | 说明 |
 | --- | --- | --- | --- |
-| 行 | **69.91%**（323/462） | 69 | 最低的是 `com.hr.config` **0/52**：`RedisConfig`/`WebConfig`/`UserDataInitializer` 只在应用启动时执行，清零后被口径排除；其余缺口是各层构造器 |
-| 分支 | **70.00%**（56/80） | 70 | 未覆盖分支集中在 JDBC 层判空（主键/COUNT 返回 null，接口打不到）与 `appendFilters` 的 name/department 空白组合 |
-| 方法 | 75.00%（135/180） | 不计入门禁 | 仅用于定位漏测的方法 |
+| 行 | **70.09%**（321/458） | **70**（本轮由棘轮从 69 抬起） | 分母 462→458 全部是被删掉的**未覆盖**行（下表逐处核对），已覆盖行数 321 一个没变——行% 上升纯粹来自分母缩小，不是覆盖增加 |
+| 分支 | **70.00%**（56/80） | 70 | 分支总数不受收敛影响（删掉的三处都没有判定）；未覆盖分支仍集中在 JDBC 层判空（主键/COUNT 返回 null，接口打不到）与 `appendFilters` 的 name/department 空白组合 |
+| 方法 | 75.14%（133/177） | 不计入门禁 | 180→177 是删除的三个方法，此前均为未覆盖；仅用于定位漏测的方法 |
 
-补 4 条 `TC-META-*` 之前，同口径基线是 124 passed / 行 **69.48%**（321/462）/ 方法 73.89%（133/180）、分支不变
-（该组数字连跑三轮完全一致，可复现）。多出的 2 行 2 方法正是 `EmployeeController.departments()` 与
-`EmployeeService.departments()`，`jacoco.xml` 复核两者 `covered=1 / missed=0`。
+容器重启后的首轮读作 **322/458 = 70.31%、方法 134/177**，与稳态轮只差 `PasswordHasher` 的静态字段初始化那一行
+（见上一节口径条）；上表取的是稳态轮，15:06 与 15:17 两轮逐项逐字相同，抬起后的阈值 70 在 15:17 那轮按
+`实测 70.09% / 阈值 70% → 达标` 实际判定过一次。
+
+收敛删除的行数逐处核对（14:03 那轮 vs 15:06 那轮，均取部署字节码）：
+
+| 删除位置 | 减少的可执行行 | 说明 |
+| --- | --- | --- |
+| `EmployeeController.departments()` | 1 | 注解与方法签名行不计为可执行行，只有 `return` 那一行；此前该端点无用例，一直是未覆盖 |
+| `EmployeeService.departments()` + 构造器里对 `DepartmentService` 的字段赋值 | 2 | 方法体 1 行未覆盖；字段赋值在启动期执行，清零口径下同样计为未覆盖 |
+| `EmployeeRepository.findDepartments()` | 1 | 跨 3 个源码行的 `queryForList` 调用按 JaCoCo 口径记 1 行；零调用方 |
+
+同口径历史数字（便于对照）：接口收敛前补上 4 条 `TC-META-*` 的那一轮（11:50）是 128 passed /
+行 **69.91%**（323/462）/ 方法 75.00%（135/180）——多出的 2 行 2 方法正是 `EmployeeController.departments()` 与
+`EmployeeService.departments()`，`jacoco.xml` 复核两者 `covered=1 / missed=0`；删掉那 4 条用例而字节码未换时
+（14:03）回到 124 passed / 行 **69.48%**（321/462）/ 方法 73.89%（133/180），与更早的基线逐字相同，连跑三轮完全一致。
 
 这一轮最初暴露的两个**真实缺口**（不是口径问题）现均已闭环，但处理方式和一开始的设想不同：
 
@@ -273,6 +300,10 @@ cd D:\hr-system\tests
 归因粒度足以支撑这个判断：删掉 4 条用例但后端字节码还没换的那一轮（2026-11-18 14:03）实测
 124 passed / 行 **321/462 = 69.48%** / 方法 133/180，与补用例之前的基线**逐字相同**，
 说明那 2 行 2 方法确实只由这 4 条用例驱动，不是别处的副作用。
+重建部署后的两轮（15:00、15:06）分母如期降到 458、已覆盖行数不变，收敛落地。
+带 token 复核线上行为时还发现：已移除的 `/api/employees/meta/departments` 返回的是 **500 `No static resource ...`**
+而不是 404——任意未映射路径同样如此，即这是全局异常处理把 `NoResourceFoundException` 归到了 `Exception` 分支，
+属既有缺陷（见评审清单 D7），与本次收敛无关，但收敛让它第一次有了可复现的观察入口。
 
 ② `AuthService.login` 的「账号已停用」分支接口侧无法触达 —— 走的是**单元测试通道**：
 `sys_user` 没有写入口（首启固定 `enabled=1`），dev 库 3306 又只绑服务器回环，测试机无法直连造前置数据。

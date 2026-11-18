@@ -26,6 +26,6 @@ jacoco:
 gate:
   output_dir: tests/reports/coverage    # 报告归档目录（已 gitignore）
   exclude_packages: []                  # 口径已定（2026-11-18）：dto/model/common/config 等一并计入门禁，不豁免
-  thresholds:                           # 由 --update-thresholds 按实测值向下取整写入，只升不降
-    line: 69                            # 2026-11-18 干净单轮实测 69.48%（321/462），124 passed 同轮
-    branch: 70                          # 同轮实测 70.00%（56/80）
+  thresholds:                           # 由 --update-thresholds 按实测值向下取整写入；低于现有下限时不写回（棘轮只升不降）
+    line: 70                            # 2026-11-18 接口收敛后重建部署，稳态干净单轮 321/458=70.09%（125 passed 同轮）
+    branch: 70                          # 同轮实测 70.00%（56/80）；接口收敛不改变分支总数，收敛前后一致
