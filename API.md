@@ -8,8 +8,8 @@
 | 接口前缀 | `/api` |
 | 数据格式 | 请求与响应均为 `application/json;charset=UTF-8` |
 | 日期格式 | `hireDate` 为 `yyyy-MM-dd`；`createdAt` / `updatedAt` 为 `yyyy-MM-dd HH:mm:ss` |
-| 文档版本 | v2.0.0 |
-| 更新日期 | 2026-10-29 |
+| 文档版本 | v2.1.0 |
+| 更新日期 | 2026-11-18 |
 
 ---
 
@@ -984,7 +984,7 @@ curl -X DELETE http://localhost:8080/api/departments/1 \
 
 ---
 
-## 五、接口清单汇总
+## 六、接口清单汇总
 
 | # | 功能 | 方法 | 路径 | 成功码 | 主要失败码 | 认证 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -995,8 +995,16 @@ curl -X DELETE http://localhost:8080/api/departments/1 \
 | 5 | 员工详情查看 | GET | `/api/employees/{id}` | 200 | 401 / 404 | 需要 |
 | 6 | 员工信息编辑 | PUT | `/api/employees/{id}` | 200 | 400 / 401 / 404 / 409 | 需要 |
 | 7 | 员工删除（软删除） | DELETE | `/api/employees/{id}` | 200 | 401 / 404 | 需要 |
+| 8 | 部门新增 | POST | `/api/departments` | 200 | 400 / 401 / 409 | 需要 |
+| 9 | 部门列表查询 | GET | `/api/departments` | 200 | 401 | 需要 |
+| 10 | 部门详情查看 | GET | `/api/departments/{id}` | 200 | 401 / 404 | 需要 |
+| 11 | 部门信息编辑 | PUT | `/api/departments/{id}` | 200 | 400 / 401 / 404 / 409 | 需要 |
+| 12 | 部门删除（软删除） | DELETE | `/api/departments/{id}` | 200 | 401 / 404 | 需要 |
 | - | 健康检查 | GET | `/api/health` | 200 | - | 无需 |
-| - | 部门字典 | GET | `/api/employees/meta/departments` | 200 | 401 | 需要 |
+| - | 部门名称字典 | GET | `/api/departments/meta/names` | 200 | 401 | 需要 |
+
+> 部门字典只有上表这一个入口。原 `GET /api/employees/meta/departments` 是它的重复实现（内部直接委托同一个服务方法，
+> 无任何附加逻辑、无消费方），已于 2026-11-18 从后端移除，编号不回收。
 
 ---
 

@@ -111,11 +111,6 @@ public class EmployeeRepository {
         return c != null && c > 0;
     }
 
-    public List<String> findDepartments() {
-        return jdbcTemplate.queryForList(
-                "SELECT DISTINCT department FROM employee WHERE deleted = 0 ORDER BY department", String.class);
-    }
-
     private void appendFilters(StringBuilder sql, List<Object> args, String name, String department) {
         if (name != null && !name.isBlank()) {
             sql.append(" AND name LIKE ?");

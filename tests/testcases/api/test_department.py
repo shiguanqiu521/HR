@@ -411,3 +411,13 @@ class TestDepartmentNames:
 
         AssertUtil.assert_status_code(department_api.delete(dept_id), 200, "删除预置部门: ")
         assert name not in department_api.get_names().json()["data"], "已删除部门不应出现在字典中"
+
+    def test_names_no_auth(self, no_auth_client):
+        """TC-DN-003 [P0] 部门字典-未认证
+
+        员工侧重复字典接口移除后，这是唯一的字典入口，鉴权锚点随之一并迁到这里：
+        防止有人把字典路径加进 AuthInterceptor 白名单（下拉数据在登录页就能请求）而无人发现。
+        """
+        resp = no_auth_client.get("/api/departments/meta/names")
+        AssertUtil.assert_status_code(resp, 401)
+        AssertUtil.assert_biz_code(resp, 401)

@@ -22,6 +22,8 @@
     jacoco:dump 对 destFile 是追加合并而不是覆盖，所以每轮 dump 前会删掉 exec_file，
     "只为清零计数器"的那次取数也被丢弃。留着旧 .exec 会让报告变成历轮并集：
     覆盖率只涨不跌，-k 也测不出单块用例集的贡献（2026-11-17 踩过，同一子集 89.18% vs 49.57%）。
+    exec_file 与 pom 中 prepare-agent 的默认文件（target/jacoco.exec）刻意分开命名：
+    单元测试通道与接口用例通道各写各的执行数据，report 阶段显式传 dataFile 只读本轮 dump 的那份。
 
 前置条件：
     1. 后端已用 coverage overlay 启动，容器内有 /opt/jacoco/jacocoagent.jar；
@@ -286,8 +288,13 @@ def sync_deployed_classes(cfg):
 
 
 def generate_report(cfg):
-    """用 jacoco.exec 生成 HTML/XML/CSV 报告（落在 maven 默认目录）"""
-    mvn_goal(cfg, "report")
+    """用本轮 dump 的 .exec 生成 HTML/XML/CSV 报告（落在 maven 默认目录）
+
+    dataFile 必须显式指定：jacoco:report 的默认值是 ${project.build.directory}/jacoco.exec，
+    与 pom 里 prepare-agent 给单元测试用的文件名相同。接口用例通道与单元测试通道各写各的
+    执行数据文件，显式传参才能保证报告读的是本轮 dump 的那份，不被本机跑过的 mvn test 覆盖。
+    """
+    mvn_goal(cfg, "report", [f"-Djacoco.dataFile={cfg['jacoco']['_exec_file']}"])
     csv_path = os.path.join(cfg["jacoco"]["_report_dir"], "jacoco.csv")
     if not os.path.exists(csv_path):
         raise RuntimeError(

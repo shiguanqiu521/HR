@@ -20,7 +20,7 @@ jacoco:
     host: 127.0.0.1                     # JaCoCo tcpserver 地址；远端部署时先建 SSH 隧道再保持本值
     port: 6300
     retry_count: 10                     # 后端刚重启时的连接重试次数
-  exec_file: backend/target/jacoco.exec # maven 默认位置，jacoco:report 无需额外参数
+  exec_file: backend/target/jacoco-api.exec # 接口用例通道专用；与 prepare-agent 的 jacoco.exec 分开，report 由脚本显式传 dataFile
   report_dir: backend/target/site/jacoco
 
 gate:

@@ -2,8 +2,8 @@
 """
 员工管理接口测试
 
-覆盖 TC-EMP-*（新增/场景）、TC-LIST-*（列表）、TC-DET-*（详情）、TC-EDT-*（编辑）、TC-DEL-*（删除）、TC-META-*（员工侧部门字典）
-已合并删除的编号（不回收）：TC-EMP-003/007/016/017/019/022、TC-LIST-003/004/009、TC-DEL-005/006
+覆盖 TC-EMP-*（新增/场景）、TC-LIST-*（列表）、TC-DET-*（详情）、TC-EDT-*（编辑）、TC-DEL-*（删除）
+已合并删除的编号（不回收）：TC-EMP-003/007/016/017/019/022、TC-LIST-003/004/009、TC-DEL-005/006、TC-META-001~004
 设计方法：等价类划分、边界值分析（上下界成对）、判定表（校验优先级与短路）、场景法、错误推测法
 预期基线：EmployeeRequest 注解 + EmployeeService 校验顺序 + GlobalExceptionHandler + AuthInterceptor
 """
@@ -795,86 +795,3 @@ class TestEmployeeDelete:
         AssertUtil.assert_biz_code(resp, 401)
         AssertUtil.assert_status_code(employee_api.get_detail(created_employee["id"]), 200,
                                       "未认证请求不应产生删除副作用: ")
-
-
-class TestEmployeeMetaDepartments:
-    """GET /api/employees/meta/departments
-
-    源码 EmployeeController.departments() → EmployeeService.departments() → DepartmentService.allNames()，
-    数据源是部门表；排序去重契约本身由 TC-DN-001/002 在共享实现上锚定，本类不重复。
-    """
-
-    def test_meta_departments_return_preset_names(self, employee_api, department_api, data_factory, data_cleaner):
-        """TC-META-001 [P0] 员工侧部门字典-返回未删除部门名称
-
-        覆盖率首轮实测该接口行/分支为 0（无任何用例调用）。
-        空库时 data==[] 会让全部相对式判定空转，故预置 2 个部门作绝对锚点。
-        """
-        names = []
-        for _ in range(2):
-            resp = department_api.create(data_factory.department_payload())
-            AssertUtil.assert_response_success(resp, "预置部门: ")
-            dept = resp.json()["data"]
-            data_cleaner.track_department(dept["id"])
-            names.append(dept["name"])
-
-        resp = employee_api.meta_departments()
-        AssertUtil.assert_response_success(resp)
-        data = resp.json()["data"]
-        assert isinstance(data, list), "字典应为数组"
-        assert all(isinstance(item, str) for item in data), "字典元素应为字符串"
-        assert len(data) >= 2, f"预置 2 个部门后字典长度应 ≥2，实际 {len(data)}"
-        assert set(names) <= set(data), f"预置部门 {names} 应全部出现在字典中，实际 {data}"
-
-    def test_meta_departments_parity_with_department_names(self, employee_api, department_api,
-                                                          data_factory, data_cleaner):
-        """TC-META-002 [P1] 员工侧部门字典-与部门侧字典完全一致（含顺序）
-
-        两条路径共用 DepartmentService.allNames()，但员工表单下拉实际调的是部门侧路径
-        （frontend/app.js:210）。分叉只能被"两接口比较"发现，各测一侧都发现不了。
-        """
-        resp = department_api.create(data_factory.department_payload())
-        AssertUtil.assert_response_success(resp, "预置部门: ")
-        dept = resp.json()["data"]
-        data_cleaner.track_department(dept["id"])
-
-        emp_side = employee_api.meta_departments()
-        dept_side = department_api.get_names()
-        AssertUtil.assert_response_success(emp_side)
-        AssertUtil.assert_response_success(dept_side)
-        emp_data, dept_data = emp_side.json()["data"], dept_side.json()["data"]
-
-        assert dept["name"] in emp_data, f"预置部门 {dept['name']} 应在员工侧字典中（比较式断言的绝对锚点）"
-        assert emp_data == dept_data, f"两个字典接口应返回完全一致的列表，实际 {emp_data} vs {dept_data}"
-
-    def test_meta_departments_exclude_employee_only_department(self, employee_api, department_api,
-                                                               data_factory, data_cleaner):
-        """TC-META-003 [P1] 员工侧部门字典-仅出现在员工记录中的部门名不进入字典
-
-        错误推测：employee.department 是无外键约束的自由文本，字典数据源可能是员工表 distinct，
-        也可能是部门表全量。源码为后者，且 EmployeeRepository.findDepartments() 已无调用方
-        （遗留方法）—— 本用例把"数据源是部门表"钉死，口径一旦改动即报警。
-        """
-        dept_name = data_factory.unique_dept_name("字典源")
-        resp = department_api.create(data_factory.department_payload(name=dept_name))
-        AssertUtil.assert_response_success(resp, "预置部门: ")
-        data_cleaner.track_department(resp.json()["data"]["id"])
-
-        emp_dept = data_factory.unique_dept_name("仅员工")
-        emp_resp = employee_api.create(data_factory.employee_payload(
-            department=emp_dept, phone=data_factory.unique_phone()))
-        AssertUtil.assert_response_success(emp_resp, "预置员工: ")
-        emp_id = emp_resp.json()["data"]["id"]
-        data_cleaner.track_employee(emp_id)
-        assert employee_api.get_detail(emp_id).json()["data"]["department"] == emp_dept, \
-            "前置未成立：员工侧应确实存在一个部门表中没有的部门名，否则本用例判定点空转"
-
-        data = employee_api.meta_departments().json()["data"]
-        assert dept_name in data, f"部门表中的 {dept_name} 应在字典中（防止因字典为空而假通过）"
-        assert emp_dept not in data, f"仅存在于员工记录的部门名 {emp_dept} 不应进入字典"
-
-    def test_meta_departments_no_auth(self, no_auth_client):
-        """TC-META-004 [P0] 员工侧部门字典-未认证"""
-        resp = no_auth_client.get("/api/employees/meta/departments")
-        AssertUtil.assert_status_code(resp, 401)
-        AssertUtil.assert_biz_code(resp, 401)

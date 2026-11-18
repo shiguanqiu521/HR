@@ -21,11 +21,9 @@ public class EmployeeService {
     private static final int MAX_PAGE_SIZE = 100;
 
     private final EmployeeRepository repository;
-    private final DepartmentService departmentService;
 
-    public EmployeeService(EmployeeRepository repository, DepartmentService departmentService) {
+    public EmployeeService(EmployeeRepository repository) {
         this.repository = repository;
-        this.departmentService = departmentService;
     }
 
     public Employee create(EmployeeRequest request) {
@@ -79,10 +77,6 @@ public class EmployeeService {
         repository.findById(id)
                 .orElseThrow(() -> BizException.notFound("员工不存在或已被删除，id=" + id));
         repository.softDelete(id, LocalDateTime.now().format(TIME_FORMATTER));
-    }
-
-    public List<String> departments() {
-        return departmentService.allNames();
     }
 
     private void validateStatus(String status) {

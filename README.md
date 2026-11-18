@@ -195,8 +195,9 @@ docker-compose down
 映射与逐条修改依据见 **接口测试用例设计评审与修改清单.md**；
 运行方式、用例编写约定、覆盖率门禁见 **[tests/README.md](./tests/README.md)**。
 
-> `backend/src/test` 目前为空，CI 中的 `mvn clean verify` 不执行任何单元测试，
-> 后端代码覆盖率只能由 `tests/coverage_gate.py` 通过 JaCoCo agent 归因到接口用例。
+> 后端代码覆盖率由 `tests/coverage_gate.py` 通过 JaCoCo agent 归因到接口用例，这是门禁认的唯一通道；
+> `backend/src/test` 里目前只有一个单元测试（`AuthServiceTest`，覆盖接口侧无法触达的「账号已停用」分支），
+> 它走 `mvn test` 自己的通道、用独立的 `.exec` 文件，两个通道的数字不混算。
 
 ## CI/CD 部署
 
