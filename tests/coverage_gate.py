@@ -9,21 +9,36 @@
 用法：
     ./.venv/Scripts/python.exe coverage_gate.py                 # 完整流程：清零+跑用例+归因+判定
     ./.venv/Scripts/python.exe coverage_gate.py -k employee      # 只跑部分用例，用于对比用例集的覆盖增量
-    ./.venv/Scripts/python.exe coverage_gate.py --check-only     # 不跑用例，直接取当前累计覆盖
+    ./.venv/Scripts/python.exe coverage_gate.py --check-only     # 不跑用例，只读上一轮清零之后新跑到的代码
     ./.venv/Scripts/python.exe coverage_gate.py --update-thresholds   # 用本轮实测值刷新门禁阈值（棘轮）
+
+字节码口径（决定数字是否可信）：
+    默认在出报告前，从运行中的容器里取回 BOOT-INF/classes 覆盖 backend/target/classes，
+    保证报告用的就是实际执行的那份字节码。JaCoCo 按 class id（类文件内容哈希）匹配执行数据，
+    本地重新编译只要与构建镜像的 JDK 补丁版本有差异就会静默丢类（显示 0% 而非报错）。
+    --build 改用本地 mvn compile，仅用于本机直连部署的调试，不能用于出覆盖率结论。
+
+取数口径（决定门禁能不能发现回归）：
+    jacoco:dump 对 destFile 是追加合并而不是覆盖，所以每轮 dump 前会删掉 exec_file，
+    "只为清零计数器"的那次取数也被丢弃。留着旧 .exec 会让报告变成历轮并集：
+    覆盖率只涨不跌，-k 也测不出单块用例集的贡献（2026-11-17 踩过，同一子集 89.18% vs 49.57%）。
 
 前置条件：
     1. 后端已用 coverage overlay 启动，容器内有 /opt/jacoco/jacocoagent.jar；
-    2. 配置里的 dump.host:dump.port 可达（远端部署时先建 SSH 隧道，见 config/coverage.yml）。
+    2. 配置里的 dump.host:dump.port 可达（远端部署时先建 SSH 隧道，见 config/coverage.yml）；
+    3. 配置里的 deploy.ssh 能免密执行 docker exec（取部署字节码用）。
 """
 import argparse
 import csv
+import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 from datetime import datetime
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,10 +55,12 @@ def parse_args():
     parser.add_argument("-k", dest="keyword", default=None, help="pytest 关键字过滤，用于测量单个用例集的覆盖增量")
     parser.add_argument("-m", dest="marker", default=None, help="pytest marker 过滤")
     parser.add_argument("--check-only", action="store_true",
-                        help="不执行用例，只 dump 当前累计数据并出报告（含清零）")
+                        help="不执行用例，只 dump 当前累计数据并出报告（不清零 agent 计数）")
     parser.add_argument("--build", action="store_true",
-                        help="出报告前先 mvn compile 刷新 backend/target/classes，"
-                             "保证字节码与服务器上运行的构建一致（版本不一致会让 JaCoCo 静默丢弃覆盖数据）")
+                        help="改用本地 mvn compile 产出字节码，跳过从部署环境取运行中的 class。"
+                             "仅适用于本机直连部署的调试；JDK 补丁版本与构建镜像不一致时会静默丢类")
+    parser.add_argument("--keep-classes", action="store_true",
+                        help="不刷新 backend/target/classes，直接用现有内容出报告（同一轮复算用）")
     parser.add_argument("--dump-host", default=None, help="覆盖配置里的 tcpserver 地址")
     parser.add_argument("--dump-port", type=int, default=None, help="覆盖配置里的 tcpserver 端口")
     parser.add_argument("--update-thresholds", action="store_true",
@@ -58,7 +75,7 @@ def load_config(path):
         path: config/coverage.yml 的路径
 
     Returns:
-        dict: 原始配置 + 派生的绝对路径字段（_backend_pom/_exec_file/_report_dir/_output_dir/_config_file）
+        dict: 原始配置 + 派生的绝对路径字段（_backend_pom/_classes_dir/_exec_file/_report_dir/_output_dir/_config_file）
     """
     import yaml
     with open(path, encoding="utf-8") as fh:
@@ -67,6 +84,9 @@ def load_config(path):
     gate = cfg["gate"]
     cfg["_config_file"] = path
     cfg["_backend_pom"] = os.path.join(REPO_ROOT, cfg["backend_pom"])
+    # jacoco:report 没有 classDirectories 参数，只读 ${project.build.outputDirectory}，
+    # 所以"用哪份字节码出报告"完全等价于"backend/target/classes 里放的是什么"。
+    cfg["_classes_dir"] = os.path.join(os.path.dirname(cfg["_backend_pom"]), "target", "classes")
     jacoco["_exec_file"] = os.path.join(REPO_ROOT, jacoco["exec_file"])
     jacoco["_report_dir"] = os.path.join(REPO_ROOT, jacoco["report_dir"])
     gate["_output_dir"] = os.path.join(REPO_ROOT, gate["output_dir"])
@@ -90,13 +110,15 @@ def find_maven():
     raise EnvironmentError("未找到 mvn，请先安装 Maven 并加入 PATH（配置里 jacoco 目标依赖 mvn 执行）")
 
 
-def run(cmd, cwd=None, allow_fail=False):
+def run(cmd, cwd=None, allow_fail=False, tail=0):
     """执行外部命令，失败时打印输出并中断
 
     Args:
         cmd: 命令参数列表
         cwd: 工作目录
         allow_fail: 为 True 时返回退出码而不抛错
+        tail: 成功时也打印输出的最后若干行。pytest 的统计行在末尾，
+              只回显退出码会把最有信息量的一行丢掉
 
     Returns:
         int: 命令退出码
@@ -104,12 +126,13 @@ def run(cmd, cwd=None, allow_fail=False):
     print("  $ " + " ".join(cmd))
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
-    if proc.returncode != 0 and not allow_fail:
+    if proc.returncode != 0:
         print(proc.stdout[-4000:] if proc.stdout else "")
         print(proc.stderr[-2000:] if proc.stderr else "")
-        raise RuntimeError(f"命令执行失败（exit={proc.returncode}）: {cmd[0]}")
-    if proc.returncode != 0 and allow_fail and proc.stdout:
-        print(proc.stdout[-2000:])
+        if not allow_fail:
+            raise RuntimeError(f"命令执行失败（exit={proc.returncode}）: {cmd[0]}")
+    elif tail and proc.stdout:
+        print("\n".join(proc.stdout.splitlines()[-tail:]))
     return proc.returncode
 
 
@@ -132,24 +155,38 @@ def mvn_goal(cfg, goal, extra_props=None):
     return run(cmd, cwd=REPO_ROOT)
 
 
-def dump_execution_data(cfg, host, port, dest_file):
-    """从运行中的后端取回 JaCoCo 执行数据，同时清零计数器
+def dump_execution_data(cfg, host, port, dest_file, reset=True, discard=False):
+    """从运行中的后端取回 JaCoCo 执行数据
+
+    jacoco-maven-plugin 的 dump 对 destFile 是**追加合并**写入而不是覆盖（2026-11-17 实测：
+    同一子集用例，保留旧 .exec 时报告 89.18%，删掉后同一命令 49.57%）。
+    所以每次 dump 前必须先删掉旧文件，否则报告算的是历轮并集——门禁失去发现回归的能力，
+    `-k` 也测不出单块用例集的覆盖贡献。
 
     Args:
         cfg: 配置字典
         host: tcpserver 地址
         port: tcpserver 端口
         dest_file: .exec 落地路径
+        reset: 取数后是否清零 agent 计数器
+        discard: 为 True 时这次取数只为清零计数器，落地的数据随即删除
     """
+    if os.path.exists(dest_file):
+        os.remove(dest_file)
     props = [
         f"-Djacoco.address={host}",
         f"-Djacoco.port={port}",
         f"-Djacoco.destFile={dest_file}",
-        "-Djacoco.reset=true",
+        f"-Djacoco.reset={'true' if reset else 'false'}",
         f"-Djacoco.retryCount={cfg['jacoco']['dump'].get('retry_count', 10)}",
     ]
     mvn_goal(cfg, "dump", props)
-    if not os.path.exists(dest_file):
+    if discard:
+        # 清零用的这次取数拿到的是"上一轮之后累计跑到的代码"（可能含手工请求、别的用例集），
+        # 不属于本轮接口用例的贡献，删掉
+        if os.path.exists(dest_file):
+            os.remove(dest_file)
+    elif not os.path.exists(dest_file):
         raise RuntimeError(f"未生成执行数据文件 {dest_file}，说明 dump 没拿到 agent 数据")
 
 
@@ -169,16 +206,83 @@ def run_pytest(cfg, args):
     if args.marker:
         cmd += ["-m", args.marker]
     cmd += [f"--env={args.env}"]
-    return run(cmd, cwd=TESTS_DIR, allow_fail=True)
+    return run(cmd, cwd=TESTS_DIR, allow_fail=True, tail=15)
 
 
 def compile_backend(cfg):
-    """刷新 backend/target/classes
+    """用本地 mvn compile 产出 backend/target/classes
 
-    JaCoCo 按 class id 匹配执行数据与字节码：服务器跑的是新 commit、本地 target/classes
-    还是旧构建时，覆盖数据会被静默丢弃，报告显示 0 覆盖而不是报错。
+    只在被测服务就跑在本机、字节码天然一致时可用。作为覆盖率结论的来源时不可靠：
+    本地 javac 与构建镜像的 JDK 补丁版本不同就会产出不同的类文件，class id 对不上的类
+    被 JaCoCo 静默丢弃，报告显示 0 覆盖而不是报错。
     """
     run([find_maven(), "-B", "-q", "-f", cfg["_backend_pom"], "compile"], cwd=REPO_ROOT)
+
+
+def sync_deployed_classes(cfg):
+    """从运行中的容器里取回实际执行的字节码，覆盖 backend/target/classes
+
+    这是让报告可信的关键一步：jacoco:report 只能读 backend/target/classes，
+    而执行数据是按 class id（类文件内容哈希）匹配的，两边必须是同一份字节码。
+
+    Args:
+        cfg: 配置字典
+
+    Returns:
+        int: 同步到本地的 class 文件数
+
+    Raises:
+        EnvironmentError: 配置缺少 deploy.ssh，或容器内取不到 class
+    """
+    deploy = cfg.get("deploy") or {}
+    target = deploy.get("ssh")
+    if not target:
+        raise EnvironmentError(
+            "config/coverage.yml 的 deploy.ssh 为空，无法取回部署字节码。"
+            "服务部署在远端时填 ssh 目标（需免密）；服务跑在本机时才用 --build")
+
+    container = deploy["container"]
+    jar = deploy["jar"]
+    prefix = deploy.get("classes_prefix", "BOOT-INF/classes/")
+    root = prefix.rstrip("/")
+    # 镜像是运行时精简镜像，有 busybox 的 unzip/tar，没有 jar；
+    # tar 成功后再清理临时目录，失败时退出码仍是 tar 的，不会被 rm 掩盖
+    inner = (f"cd /tmp && rm -rf jacoco_classes && mkdir jacoco_classes && cd jacoco_classes "
+             f"&& unzip -q -o {shlex.quote(jar)} {shlex.quote(prefix + '*')} "
+             f"&& tar -cf - {shlex.quote(root)} "
+             f"&& cd / && rm -rf /tmp/jacoco_classes")
+    remote = f"docker exec {shlex.quote(container)} sh -c {shlex.quote(inner)}"
+    cmd = ["ssh", "-o", "BatchMode=yes", target, remote]
+    print(f"  $ ssh {target} docker exec {container} <unzip {jar}:{prefix} 并打包>")
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise EnvironmentError(
+            f"取回部署字节码失败（exit={proc.returncode}）："
+            f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[-1500:]}\n"
+            f"请确认 {target} 能免密登录、容器 {container} 在运行、jar 路径 {jar} 正确")
+
+    classes_dir = cfg["_classes_dir"]
+    members = []
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as archive:
+        for member in archive.getmembers():
+            if not member.isfile() or not member.name.endswith(".class"):
+                continue
+            rel = member.name[len(root) + 1:]
+            if rel.startswith(("/", "\\")) or ".." in rel.replace("\\", "/").split("/"):
+                raise EnvironmentError(f"部署产物里有异常路径：{member.name}")
+            members.append((rel, member))
+        if not members:
+            raise EnvironmentError(
+                f"容器 {container} 的 {jar} 里没找到 {prefix} 下的 class，"
+                "请核对 config/coverage.yml 的 deploy.jar 与 deploy.classes_prefix")
+
+        shutil.rmtree(classes_dir, ignore_errors=True)
+        for rel, member in members:
+            dest = os.path.join(classes_dir, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with archive.extractfile(member) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+    return len(members)
 
 
 def generate_report(cfg):
@@ -187,7 +291,8 @@ def generate_report(cfg):
     csv_path = os.path.join(cfg["jacoco"]["_report_dir"], "jacoco.csv")
     if not os.path.exists(csv_path):
         raise RuntimeError(
-            f"未生成 {csv_path}，请确认 {cfg['jacoco']['_exec_file']} 存在且 backend/target/classes 已编译")
+            f"未生成 {csv_path}，请确认 {cfg['jacoco']['_exec_file']} 存在，"
+            f"且 {cfg['_classes_dir']} 里有字节码（默认由 deploy.ssh 从容器取回）")
     return csv_path
 
 
@@ -367,19 +472,39 @@ def main():
 
     print(f"覆盖率采集通道：{host}:{port}（JaCoCo tcpserver）")
 
-    if args.build:
-        print("\n[准备] 刷新后端字节码（--build）")
+    classes_source = "keep"
+    if args.keep_classes:
+        print("\n[准备] 沿用现有 backend/target/classes（--keep-classes）")
+    elif args.build:
+        print("\n[准备] 本地编译产出字节码（--build）")
+        print("        警告：本机 JDK 与构建镜像的补丁版本不同会静默丢类，此模式的数字不能作为覆盖率结论")
         compile_backend(cfg)
+        classes_source = "local-build"
+    else:
+        print("\n[准备] 取回运行中的字节码")
+        try:
+            classes = sync_deployed_classes(cfg)
+        except Exception as exc:
+            print(f"取回失败：{exc}")
+            print("没有一致的字节码就无法出报告：修好 ssh/容器后再复跑，"
+                  "或本机直连部署时临时用 --build（数字不可信）")
+            return 2
+        print(f"        已用容器内的 class 覆盖 backend/target/classes（{classes} 个）")
+        classes_source = "deployed"
 
-    print("\n[1/5] 清零历史计数")
-    try:
-        dump_execution_data(cfg, host, port, exec_file)
-    except Exception as exc:
-        print(f"清零失败：{exc}")
-        print("请确认后端已用 coverage overlay 启动，且端口可达（服务器只有 docker-compose 1.29.2）：\n"
-              "  docker-compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend\n"
-              "  远端部署时先建隧道：ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134")
-        return 2
+    if args.check_only:
+        print("\n[1/5] 跳过清零（--check-only：读上一轮取数之后新跑到的代码）")
+        print("        上一轮完整采集结束时计数器已清零，期间没有流量的话本轮就是 0%")
+    else:
+        print("\n[1/5] 清零历史计数")
+        try:
+            dump_execution_data(cfg, host, port, exec_file, discard=True)
+        except Exception as exc:
+            print(f"清零失败：{exc}")
+            print("请确认后端已用 coverage overlay 启动，且端口可达（重建走 Compose v2）：\n"
+                  "  docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend\n"
+                  "  远端部署时先建隧道：ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134")
+            return 2
 
     pytest_exit = 0
     if not args.check_only:
@@ -391,8 +516,8 @@ def main():
     else:
         print("\n[2/5] 跳过用例执行（--check-only）")
 
-    print("\n[3/5] 取回执行数据")
-    dump_execution_data(cfg, host, port, exec_file)
+    print("\n[3/5] 取回执行数据" + ("（保留累计计数，供下次复算）" if args.check_only else ""))
+    dump_execution_data(cfg, host, port, exec_file, reset=not args.check_only)
 
     print("\n[4/5] 生成 JaCoCo 报告")
     csv_path = generate_report(cfg)
@@ -405,17 +530,20 @@ def main():
 
     if totals["line"]["total"] == 0:
         print("\n警告：报告里没有匹配到任何被测类。逐项检查 config/coverage.yml 的 package_prefix、"
-              "backend/target/classes 是否已编译、agent 启动参数里的 includes=com.hr.*")
+              f"backend/target/classes 是否非空（本轮字节码来源：{classes_source}）、"
+              "agent 启动参数里的 includes=com.hr.*")
     elif totals["line"]["covered"] == 0 and not args.check_only:
-        print("\n警告：用例已执行但覆盖为 0。最常见原因是本地 backend/target/classes 与服务器运行的不是同一"
-              " commit——JaCoCo 按 class id 匹配，id 不一致时执行数据会被静默丢弃。"
-              "请本地 git pull 后带 --build 复跑，并确认服务器已部署该 commit")
+        print("\n警告：用例已执行但覆盖为 0。先确认报告的字节码口径：")
+        print("  --build / --keep-classes 下，backend/target/classes 与容器里运行的类不是同一份时，"
+              "JaCoCo 会按 class id 静默丢弃执行数据——去掉这两个开关复跑，让它取部署字节码")
+        print("  取部署字节码后仍为 0，才按用例侧排查：请求是否真的打到了这个后端（base_url、隧道、防火墙）")
 
     passed, verdict = evaluate_gate(cfg, totals)
     archived_html, summary_path = write_outputs(
         cfg, packages, totals,
         {"env": args.env, "host": host, "port": port, "driver": "check-only" if args.check_only else "pytest",
          "keyword": args.keyword, "marker": args.marker, "pytest_exit": pytest_exit,
+         "classes_source": classes_source,
          "captured_at": datetime.now().isoformat(timespec="seconds")})
     print(f"\nHTML 报告：{archived_html}")
     print(f"最新报告：{os.path.join(cfg['gate']['_output_dir'], 'latest', 'index.html')}")

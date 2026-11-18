@@ -92,6 +92,17 @@ class EmployeeAPI:
         logger.info(f"[EmployeeAPI] 删除员工: id={emp_id}")
         return self.req.delete(f"/api/employees/{emp_id}")
     
+    def meta_departments(self):
+        """
+        部门名称字典（供员工表单/筛选的部门候选使用）
+        
+        Returns:
+            requests.Response: 响应对象，data 为部门名称字符串列表；
+                               数据源是部门表的未删除记录，与员工表已填写的 department 文本无关
+        """
+        logger.info("[EmployeeAPI] 查询部门字典")
+        return self.req.get("/api/employees/meta/departments")
+    
     def create_and_track(self, payload, cleaner):
         """
         创建员工并追踪到清理器（用于自动清理测试数据）

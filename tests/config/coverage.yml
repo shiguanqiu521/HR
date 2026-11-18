@@ -3,6 +3,16 @@
 
 backend_pom: backend/pom.xml            # mvn 的工作对象，同时决定 classfiles/sourcefiles 位置
 
+# 出报告前，用"实际运行的那份字节码"替换 backend/target/classes。
+# JaCoCo 按 class id（类文件内容哈希）匹配执行数据与字节码：本地 javac 与构建镜像的 JDK
+# 补丁版本不同就会产出不同字节，id 不一致的类被静默丢弃、报告显示 0 覆盖且不报错。
+# 2026-11-17 实测因此丢掉了整个 EmployeeService（49 行）。
+deploy:
+  ssh: root@106.12.144.134              # 能执行 docker exec 的目标；本机部署可留空并改用 --build
+  container: hr-backend
+  jar: /app/app.jar
+  classes_prefix: BOOT-INF/classes/     # Spring Boot 可执行 jar 内的应用类目录
+
 jacoco:
   version: "0.8.11"                     # 必须与 backend/pom.xml 的 jacoco-maven-plugin 版本一致
   package_prefix: com.hr.               # 只统计被测系统自身的包，第三方库不计入
@@ -15,7 +25,7 @@ jacoco:
 
 gate:
   output_dir: tests/reports/coverage    # 报告归档目录（已 gitignore）
-  exclude_packages: []                  # 不纳入门禁的包前缀，首轮实测确认口径后再填
-  thresholds:
-    line: null                          # 行覆盖率下限（百分比）；null = 只测量不判定
-    branch: null                        # 分支覆盖率下限（百分比）
+  exclude_packages: []                  # 口径已定（2026-11-18）：dto/model/common/config 等一并计入门禁，不豁免
+  thresholds:                           # 由 --update-thresholds 按实测值向下取整写入，只升不降
+    line: 69                            # 2026-11-18 干净单轮实测 69.48%（321/462），124 passed 同轮
+    branch: 70                          # 同轮实测 70.00%（56/80）

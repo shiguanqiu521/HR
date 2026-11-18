@@ -9,7 +9,7 @@ tests/
 ├── config/                 # 配置层
 │   ├── __init__.py
 │   ├── settings.py         # 环境配置代理（dev/test/prod 运行时切换）
-│   ├── coverage.yml        # 覆盖率归因与门禁配置（统计范围、阈值、tcpserver 地址）
+│   ├── coverage.yml        # 覆盖率归因与门禁配置（统计范围、阈值、tcpserver 地址、部署字节码来源）
 │   ├── .env.example        # 配置模板（可提交，不含真实密钥）
 │   ├── .env.dev            # 开发环境配置（已被 .gitignore 忽略）
 │   ├── .env.test           # 测试环境配置（同上）
@@ -63,13 +63,15 @@ tests/
 
 | 范围 | 认证 | 员工 | 部门 | 合计 |
 | --- | --- | --- | --- | --- |
-| 用例表有效用例 | 15 | 53 | 24 | **92** |
-| 自动化用例函数 | 15 | 52 | 24 | **91** |
-| pytest item（参数行展开） | 22 | 72 | 30 | **124** |
+| 用例表有效用例 | 15 | 57 | 24 | **96** |
+| 自动化用例函数 | 15 | 56 | 24 | **95** |
+| pytest item（参数行展开） | 22 | 76 | 30 | **128** |
 | dev 实测（2026-11-10） | 21 | 72 | 30 | **123 passed / 0 failed / 1 skipped**，26.0s |
+| dev 实测（2026-11-17，覆盖率门禁同轮） | 22 | 72 | 30 | **124 passed / 0 failed / 0 skipped**，22.91s |
+| dev 实测（2026-11-18，补 4 条 `TC-META-*` 后同轮） | 22 | 76 | 30 | **128 passed / 0 failed / 0 skipped**，23.46s |
 
-- 用例表：`../HR系统测试用例.xlsx`（功能测试 107 行 = 92 有效 + 15 已删除标注行；变更类型分布 修改 48 / 新增 15 / 不变 29），逐条变更记录见「用例变更记录」sheet（85 条）。
-- 唯一 skipped：`TC-AUTH-014`（过期 token 本地自签），在 `config/.env.dev` 填入与服务端一致的 `HR_JWT_SECRET` 后转执行，届时目标为 124 passed / 0 failed / 0 skipped。
+- 用例表：`../HR系统测试用例.xlsx`（功能测试 111 行 = 96 有效 + 15 已删除标注行；有效用例变更类型分布 修改 48 / 新增 19 / 不变 29），逐条变更记录见「用例变更记录」sheet（90 条）。
+- `TC-AUTH-014`（过期 token 本地自签）已在 `config/.env.dev` 填入与服务端一致的 `HR_JWT_SECRET` 后转执行，2026-11-17 实测通过，无 skipped。
 - 唯一未自动化的有效用例：`TC-DEL-007`（软删除落库校验，需数据库直连，保留为手工用例）。
 - 设计与评审说明：`../接口测试用例设计评审与修改清单.md`。
 
@@ -149,30 +151,37 @@ export HR_JWT_SECRET=
 后端单元测试目录 `backend/src/test` 为空，所以在接入这一段之前，"接口测试到底覆盖了多少后端代码"完全无法回答。
 
 **原理**：后端 JVM 以 JaCoCo agent 的 `tcpserver` 模式运行 → 本地清零计数器 → 跑接口用例 → dump 取回执行数据 →
-用 `jacoco:report` 对齐 `backend/target/classes` 出报告 → 按包归因并按阈值判定。
+用 `jacoco:report` 出报告 → 按包归因并按阈值判定。
+`jacoco:report` 没有 `classDirectories` 参数，只读 `${project.build.outputDirectory}`，
+所以"用哪份字节码出报告"等价于"`backend/target/classes` 里放的是什么"。
 agent 只在容器设置了 `JAVA_TOOL_OPTIONS` 时挂载，镜像里预置 jar 但默认不生效，因此对正常部署无影响。
 
 **一次性准备（服务器，需重启后端容器）**
 
-dev 服务器实况：仓库在 `/root/HR`，分支只有 `master`，只有 `docker-compose` 1.29.2（无 compose v2 插件），
-登录用户 `root`。命令统一按这个环境写，不要混用 `docker compose`。
+dev 服务器实况：仓库在 `/root/HR`，分支只有 `master`，登录用户 `root`；已装 Compose v2。
+**重建一律走 `docker compose`（v2）**——v1 1.29.2 与 Docker Engine 29 不兼容，任何 recreate 都会在"旧容器改名让位"
+之后抛 `KeyError: 'ContainerConfig'`，结果服务直接消失（2026-11-17 实测踩实）。
 
 ```bash
 cd /root/HR
 git pull origin master
-docker-compose build backend                    # 镜像内加入 jacocoagent.jar，耗时比平时多几秒
-docker-compose -f docker-compose.yml -f docker-compose.coverage.yml config \
+docker compose build backend                    # 镜像内加入 jacocoagent.jar，耗时比平时多几秒
+docker compose -f docker-compose.yml -f docker-compose.coverage.yml config \
     | sed -n '/backend:/,/frontend:/p'         # 校验：JAVA_TOOL_OPTIONS 与 6300 都要出现，且 8080 仍在
-docker-compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
 docker logs --tail 50 hr-backend | grep -i "JAVA_TOOL_OPTIONS\|jacoco\|Started HrApplication"
 ```
 最后一条必须打印 `Picked up JAVA_TOOL_OPTIONS: -javaagent:/opt/jacoco/jacocoagent.jar=...`，
 没有就说明 agent 没挂上，先别采集。用完恢复：
-`docker-compose -f docker-compose.yml up -d backend`。
+`docker compose -f docker-compose.yml up -d backend`。
+
+> 若这台机器用 v1 采集过，可能残留 `<容器id>_<name>` 形态的让位容器（v1/v2 共用同一套改名规则），
+> v2 会以 `The container name "/xxx_hr-mysql" is already in use` 拒绝重建。
+> 先确认这些容器不是当前在跑的服务（`docker ps -a`），再 `docker rm -f` 掉它们。
 
 > 已知不一致（待单独修正，不影响本流程）：`docker/deploy.sh` 与 `.github/workflows/ci-cd.yml`
 > 里写的是 `/opt/hr-system`、`git pull origin main`、`docker compose`，与实际服务器的
-> `/root/HR`、`master`、`docker-compose` 三项都不符，因此 CI 的部署阶段在这台机器上跑不通。
+> `/root/HR`、`master` 两项不符，因此 CI 的部署阶段在这台机器上跑不通。
 
 **采集通道**：overlay 默认把 tcpserver 只绑到服务器回环（`127.0.0.1:6300`），公网不可达。二选一
 ```bash
@@ -183,13 +192,18 @@ ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134
 # 并由云安全组把 6300 限制到指定来源 IP；采集时加 --dump-host 106.12.144.134
 ```
 
-**每轮执行（本地）**
+取部署字节码（`[准备]` 步骤）走的是同一条 ssh 通道，需要本机公钥已加入服务器 `authorized_keys`、
+可以非交互执行 `docker exec`；不满足时脚本以退出码 2 停下，不会给出不可比的数字。
+
+**每轮执行（本地，需先起好 SSH 隧道）**
 ```bash
 cd D:\hr-system\tests
-.venv\Scripts\python.exe coverage_gate.py                       # 清零 + 全量接口用例 + 归因 + 门禁
+.venv\Scripts\python.exe coverage_gate.py                       # 取部署字节码 + 清零 + 全量用例 + 归因 + 门禁
 .venv\Scripts\python.exe coverage_gate.py -k department         # 只跑部分用例，看这块用例集贡献了多少覆盖
-.venv\Scripts\python.exe coverage_gate.py --check-only           # 不跑用例，取当前累计数据
+.venv\Scripts\python.exe coverage_gate.py --check-only           # 不跑用例，只读上一轮清零之后新跑到的代码
 .venv\Scripts\python.exe coverage_gate.py --update-thresholds    # 用实测值固化门禁下限（棘轮）
+.venv\Scripts\python.exe coverage_gate.py --keep-classes         # 复用上一轮的字节码重算（调试用，非结论）
+.venv\Scripts\python.exe coverage_gate.py --build                # 本地编译字节码（服务跑本机时的调试，非结论）
 ```
 
 **输出**
@@ -199,15 +213,51 @@ cd D:\hr-system\tests
 
 **门禁口径**
 - `config/coverage.yml` 的 `package_prefix` 决定统计范围（默认 `com.hr.`），`exclude_packages` 可把纯数据/配置包移出门禁；
-  首轮实测确认口径后再填，不要凭感觉排除。
+  2026-11-18 口径已定：**不豁免任何包**，`dto`/`model`/`common`/`config` 一并计入，阈值按全量数字固化。
 - `thresholds.line/branch` 为 `null` 时只测量不判定；核对后 `--update-thresholds` 写入下限（向下取整）。
   阈值只升不降：回退必须显式改配置并在评审中说明原因。
 - 用例存在 failed 时本轮覆盖率**不作为质量结论**（脚本会在判定后提示），先按「失败归因先于改用例」处理。
 - 计数在采集前清零，所以只有**接口用例驱动的执行**计入覆盖；仅在应用启动阶段跑一次的代码
-  （`@PostConstruct`、建表初始化等）会显示为未覆盖，属口径设定而非缺陷。
-- 报告按 class id 对齐字节码：本地 `backend/target/classes` 与服务器运行的不是同一 commit 时，
-  覆盖数据会被 JaCoCo 静默丢弃并显示 0 覆盖。本地先 `git pull`，再带 `--build` 采集。
+  （`@PostConstruct`、建表初始化、`@Bean` 装配、各层构造器）会显示为未覆盖，属口径设定而非缺陷。
+  这条口径的代价是实测的：`com.hr.config` 整包 0%，加上各类构造器共约 91 行，占总行数的 20%。
+  **口径已定（2026-11-18）：采用清零协议。** 装配代码写错的表现是容器起不来，用例集第一条请求就会失败，
+  排除在外不损失信号；其中唯一有业务含义的 `UserDataInitializer`（首启建 admin）按 `TC-DEL-007` 的先例
+  归入需要数据库直连的手工/集成用例，不塞进接口自动化。冷启动协议（重启后端 → 跑一轮 → 取数时不清零）不采用：
+  它要求每次测量都中断一次共享服务，而且度量的是部署行为而不是用例集的有效性。
+- **`.exec` 每轮必须重建**：`jacoco:dump` 对 `destFile` 是追加合并而不是覆盖，脚本因此在每次 dump 前先删掉
+  `backend/target/jacoco.exec`，且把"只为清零计数器"的那次取数直接丢弃。手工调用 mvn 目标采集时若忘了删，
+  报告就变成历轮并集——门禁将永远测不出覆盖率下降，`-k` 也测不出单块用例集的贡献。
+  `--check-only` 只删旧文件、不清零 agent 计数，读的是自上次清零以来的累计覆盖。
+- **字节码口径决定数字是否可信**：执行数据与字节码按 class id（类文件内容哈希）匹配，报告默认在采集前
+  用 `config/coverage.yml` 的 `deploy.ssh` 从运行中的容器取回 `BOOT-INF/classes` 覆盖 `backend/target/classes`，
+  保证出报告用的就是实际执行的那份。本机 javac 与构建镜像的 JDK 补丁版本不同就会产出不同的类文件，
+  id 对不上的类被 JaCoCo **静默丢弃**（显示 0% 而不是报错）——2026-11-17 实测因此丢掉了整个 `EmployeeService`，
+  `com.hr.service` 只报 45.05%，而取回部署字节码后的干净单轮是 83.52%。
+  `--build`（本地编译）只在服务跑在本机时用于调试，`--keep-classes` 用于对同一轮数据复算，
+  两者的数字都不作为覆盖率结论。
 - coverage overlay 只用于 dev/test；生产环境不启用，也不要把 6300 开放到公网。
+
+**干净单轮实测（2026-11-18，128 passed 同轮，字节码来源 = 部署容器，连跑两轮完全一致）**
+
+| 口径 | 实测 | 门禁下限 | 说明 |
+| --- | --- | --- | --- |
+| 行 | **69.91%**（323/462） | 69 | 最低的是 `com.hr.config` **0/52**：`RedisConfig`/`WebConfig`/`UserDataInitializer` 只在应用启动时执行，清零后被口径排除；其余缺口是各层构造器 |
+| 分支 | **70.00%**（56/80） | 70 | 未覆盖分支集中在 JDBC 层判空（主键/COUNT 返回 null，接口打不到）与 `appendFilters` 的 name/department 空白组合 |
+| 方法 | 75.00%（135/180） | 不计入门禁 | 仅用于定位漏测的方法 |
+
+补 4 条 `TC-META-*` 之前，同口径基线是 124 passed / 行 **69.48%**（321/462）/ 方法 73.89%（133/180）、分支不变
+（该组数字连跑三轮完全一致，可复现）。多出的 2 行 2 方法正是 `EmployeeController.departments()` 与
+`EmployeeService.departments()`，`jacoco.xml` 复核两者 `covered=1 / missed=0`。
+
+这一轮最初暴露的两个**真实缺口**（不是口径问题）现在的状态：
+① `GET /api/employees/meta/departments` 及其下游无用例调用 —— **已闭环**（`TC-META-001~004`）；
+② `AuthService.login` 的「账号已停用」分支接口侧无法触达（无停用账号的写入口，需数据库直连构造前置数据或补单元测试）—— **仍未处理**。
+另：`EmployeeRepository.findDepartments()` 至今无任何调用方，本轮报告仍显示 missed，是遗留方法而非漏测，已列为改进建议。
+
+**为什么数字比 2026-11-17 记录的 89.18% 低**：那批数字是脏的，两个污染源——
+① `jacoco:dump` 对 `destFile` 是**追加合并**，历轮数据全攒在 `backend/target/jacoco.exec` 里，报告算的是并集；
+② 并集里还混着容器启动那一刻的**启动期覆盖**（config 整包 + 各层构造器 ≈ 91 行），而清零协议下这部分按口径不计入。
+同一子集用例，保留旧 `.exec` 时报 89.18%，删掉后同一命令报 49.57%——这就是判据。
 
 ## 分层说明
 
