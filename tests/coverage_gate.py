@@ -28,7 +28,8 @@
 前置条件：
     1. 后端已用 coverage overlay 启动，容器内有 /opt/jacoco/jacocoagent.jar；
     2. 配置里的 dump.host:dump.port 可达（远端部署时先建 SSH 隧道，见 config/coverage.yml）；
-    3. 配置里的 deploy.ssh 能免密执行 docker exec（取部署字节码用）。
+    3. 字节码取回通道可用：本机驱动远端部署用 deploy.mode=ssh（需免密），
+       CI/同机部署用 deploy.mode=file（读部署步骤 docker cp 落盘的 jar，不需要 docker 权限）。
 """
 import argparse
 import csv
@@ -41,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from datetime import datetime
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +94,9 @@ def load_config(path):
     jacoco["_exec_file"] = os.path.join(REPO_ROOT, jacoco["exec_file"])
     jacoco["_report_dir"] = os.path.join(REPO_ROOT, jacoco["report_dir"])
     gate["_output_dir"] = os.path.join(REPO_ROOT, gate["output_dir"])
+    deploy = cfg.get("deploy") or {}
+    if deploy.get("local_jar"):
+        deploy["_local_jar"] = os.path.join(REPO_ROOT, deploy["local_jar"])
     return cfg
 
 
@@ -221,8 +226,121 @@ def compile_backend(cfg):
     run([find_maven(), "-B", "-q", "-f", cfg["_backend_pom"], "compile"], cwd=REPO_ROOT)
 
 
+def _rel_class_path(name, root):
+    """归档内的 class 路径转成相对 classes 目录的路径
+
+    Args:
+        name: 归档条目名，如 BOOT-INF/classes/com/hr/X.class
+        root: classes 目录在归档里的位置，如 BOOT-INF/classes
+
+    Returns:
+        str: 如 com/hr/X.class
+
+    Raises:
+        EnvironmentError: 条目名越出 classes 目录（绝对路径或含 ..），不能落盘
+    """
+    rel = name[len(root) + 1:]
+    if rel.startswith(("/", "\\")) or ".." in rel.replace("\\", "/").split("/"):
+        raise EnvironmentError(f"部署产物里有异常路径：{name}")
+    return rel
+
+
+def _classes_from_ssh(deploy, root):
+    """走 ssh + docker exec 从运行中的容器取回字节码（被测服务在别的机器上时用）
+
+    镜像是运行时精简镜像，有 busybox 的 unzip/tar，没有 jar；
+    tar 成功后再清理临时目录，失败时退出码仍是 tar 的，不会被 rm 掩盖。
+
+    Args:
+        deploy: 配置的 deploy 段
+        root: classes 目录在 jar 里的位置
+
+    Returns:
+        list: [(class 相对路径, 字节内容)]
+
+    Raises:
+        EnvironmentError: 未配置 ssh 目标，或远端取数失败/取到空集合
+    """
+    target = deploy.get("ssh")
+    if not target:
+        raise EnvironmentError(
+            "deploy.mode=ssh 但 deploy.ssh 为空，无法取回部署字节码。"
+            "服务部署在远端时填 ssh 目标（需免密）；"
+            "CI 或同机部署改用 deploy.mode=file（不需要 ssh 免密，也不需要 docker 权限）")
+
+    container = deploy["container"]
+    jar = deploy["jar"]
+    inner = (f"cd /tmp && rm -rf jacoco_classes && mkdir jacoco_classes && cd jacoco_classes "
+             f"&& unzip -q -o {shlex.quote(jar)} {shlex.quote(root + '/*')} "
+             f"&& tar -cf - {shlex.quote(root)} "
+             f"&& cd / && rm -rf /tmp/jacoco_classes")
+    remote = f"docker exec {shlex.quote(container)} sh -c {shlex.quote(inner)}"
+    cmd = ["ssh", "-o", "BatchMode=yes", target, remote]
+    print(f"  $ ssh {target} docker exec {container} <unzip {jar}:{root}/ 并打包>")
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise EnvironmentError(
+            f"取回部署字节码失败（exit={proc.returncode}）："
+            f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[-1500:]}\n"
+            f"请确认 {target} 能免密登录、容器 {container} 在运行、jar 路径 {jar} 正确")
+
+    entries = []
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as archive:
+        for member in archive.getmembers():
+            if not member.isfile() or not member.name.endswith(".class"):
+                continue
+            with archive.extractfile(member) as src:
+                entries.append((_rel_class_path(member.name, root), src.read()))
+    if not entries:
+        raise EnvironmentError(
+            f"容器 {container} 的 {jar} 里没找到 {root}/ 下的 class，"
+            "请核对 config/coverage.yml 的 deploy.jar 与 deploy.classes_prefix")
+    return entries
+
+
+def _classes_from_local_jar(deploy, root):
+    """读部署步骤落盘的可执行 jar，纯 python 解 zip（CI 里用这一条通道）
+
+    runner 容器刻意不挂 /var/run/docker.sock —— 那等于把宿主机 root 交出去。
+    所以字节码不现取，由部署管道 `docker cp` 出 local_jar，这里只读文件。
+
+    Args:
+        deploy: 配置的 deploy 段
+        root: classes 目录在 jar 里的位置
+
+    Returns:
+        list: [(class 相对路径, 字节内容)]
+
+    Raises:
+        EnvironmentError: 未配置或没有 local_jar，或 jar 里没有 class
+    """
+    jar = deploy.get("_local_jar")
+    if not jar:
+        raise EnvironmentError("deploy.mode=file 但 deploy.local_jar 为空，"
+                               "填部署产物落盘路径（相对仓库根目录）")
+    if not os.path.exists(jar):
+        raise EnvironmentError(
+            f"deploy.mode=file 但部署产物不存在：{jar}\n"
+            f"先由部署步骤把运行中的那份字节码落盘：\n"
+            f"  mkdir -p {os.path.dirname(jar)} && "
+            f"docker cp {deploy['container']}:{deploy['jar']} {jar}")
+
+    print(f"  $ 读取部署产物 {jar} 的 {root}/*")
+    entries = []
+    with zipfile.ZipFile(jar) as archive:
+        for name in archive.namelist():
+            if not name.startswith(root + "/") or not name.endswith(".class"):
+                continue
+            entries.append((_rel_class_path(name, root), archive.read(name)))
+    if not entries:
+        raise EnvironmentError(
+            f"{jar} 里没找到 {root}/ 下的 class，"
+            "请核对 config/coverage.yml 的 deploy.classes_prefix（Spring Boot 可执行 jar 是 BOOT-INF/classes）")
+    return entries
+
+
 def sync_deployed_classes(cfg):
-    """从运行中的容器里取回实际执行的字节码，覆盖 backend/target/classes
+    """用实际执行的字节码覆盖 backend/target/classes，取回通道由 deploy.mode 决定
 
     这是让报告可信的关键一步：jacoco:report 只能读 backend/target/classes，
     而执行数据是按 class id（类文件内容哈希）匹配的，两边必须是同一份字节码。
@@ -234,57 +352,26 @@ def sync_deployed_classes(cfg):
         int: 同步到本地的 class 文件数
 
     Raises:
-        EnvironmentError: 配置缺少 deploy.ssh，或容器内取不到 class
+        EnvironmentError: deploy.mode 不认识，或对应通道取不到字节码
     """
     deploy = cfg.get("deploy") or {}
-    target = deploy.get("ssh")
-    if not target:
-        raise EnvironmentError(
-            "config/coverage.yml 的 deploy.ssh 为空，无法取回部署字节码。"
-            "服务部署在远端时填 ssh 目标（需免密）；服务跑在本机时才用 --build")
-
-    container = deploy["container"]
-    jar = deploy["jar"]
-    prefix = deploy.get("classes_prefix", "BOOT-INF/classes/")
-    root = prefix.rstrip("/")
-    # 镜像是运行时精简镜像，有 busybox 的 unzip/tar，没有 jar；
-    # tar 成功后再清理临时目录，失败时退出码仍是 tar 的，不会被 rm 掩盖
-    inner = (f"cd /tmp && rm -rf jacoco_classes && mkdir jacoco_classes && cd jacoco_classes "
-             f"&& unzip -q -o {shlex.quote(jar)} {shlex.quote(prefix + '*')} "
-             f"&& tar -cf - {shlex.quote(root)} "
-             f"&& cd / && rm -rf /tmp/jacoco_classes")
-    remote = f"docker exec {shlex.quote(container)} sh -c {shlex.quote(inner)}"
-    cmd = ["ssh", "-o", "BatchMode=yes", target, remote]
-    print(f"  $ ssh {target} docker exec {container} <unzip {jar}:{prefix} 并打包>")
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        raise EnvironmentError(
-            f"取回部署字节码失败（exit={proc.returncode}）："
-            f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[-1500:]}\n"
-            f"请确认 {target} 能免密登录、容器 {container} 在运行、jar 路径 {jar} 正确")
+    mode = deploy.get("mode", "ssh")
+    root = (deploy.get("classes_prefix") or "BOOT-INF/classes/").rstrip("/")
+    if mode == "ssh":
+        entries = _classes_from_ssh(deploy, root)
+    elif mode == "file":
+        entries = _classes_from_local_jar(deploy, root)
+    else:
+        raise EnvironmentError(f"未知的 deploy.mode={mode!r}，可选 ssh（远端现取）/ file（读落盘 jar）")
 
     classes_dir = cfg["_classes_dir"]
-    members = []
-    with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as archive:
-        for member in archive.getmembers():
-            if not member.isfile() or not member.name.endswith(".class"):
-                continue
-            rel = member.name[len(root) + 1:]
-            if rel.startswith(("/", "\\")) or ".." in rel.replace("\\", "/").split("/"):
-                raise EnvironmentError(f"部署产物里有异常路径：{member.name}")
-            members.append((rel, member))
-        if not members:
-            raise EnvironmentError(
-                f"容器 {container} 的 {jar} 里没找到 {prefix} 下的 class，"
-                "请核对 config/coverage.yml 的 deploy.jar 与 deploy.classes_prefix")
-
-        shutil.rmtree(classes_dir, ignore_errors=True)
-        for rel, member in members:
-            dest = os.path.join(classes_dir, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with archive.extractfile(member) as src, open(dest, "wb") as out:
-                shutil.copyfileobj(src, out)
-    return len(members)
+    shutil.rmtree(classes_dir, ignore_errors=True)
+    for rel, data in entries:
+        dest = os.path.join(classes_dir, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as out:
+            out.write(data)
+    return len(entries)
 
 
 def generate_report(cfg):
@@ -299,7 +386,7 @@ def generate_report(cfg):
     if not os.path.exists(csv_path):
         raise RuntimeError(
             f"未生成 {csv_path}，请确认 {cfg['jacoco']['_exec_file']} 存在，"
-            f"且 {cfg['_classes_dir']} 里有字节码（默认由 deploy.ssh 从容器取回）")
+            f"且 {cfg['_classes_dir']} 里有字节码（默认由 deploy.mode 指定的通道取回）")
     return csv_path
 
 
@@ -499,16 +586,17 @@ def main():
         compile_backend(cfg)
         classes_source = "local-build"
     else:
-        print("\n[准备] 取回运行中的字节码")
+        mode = (cfg.get("deploy") or {}).get("mode", "ssh")
+        print(f"\n[准备] 取回运行中的字节码（deploy.mode={mode}）")
         try:
             classes = sync_deployed_classes(cfg)
         except Exception as exc:
             print(f"取回失败：{exc}")
-            print("没有一致的字节码就无法出报告：修好 ssh/容器后再复跑，"
+            print("没有一致的字节码就无法出报告：修好取回通道后再复跑，"
                   "或本机直连部署时临时用 --build（数字不可信）")
             return 2
-        print(f"        已用容器内的 class 覆盖 backend/target/classes（{classes} 个）")
-        classes_source = "deployed"
+        print(f"        已用部署的 class 覆盖 backend/target/classes（{classes} 个）")
+        classes_source = f"deployed-{mode}"
 
     if args.check_only:
         print("\n[1/5] 跳过清零（--check-only：读上一轮取数之后新跑到的代码）")

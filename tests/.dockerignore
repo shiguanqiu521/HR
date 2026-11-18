@@ -1,0 +1,4 @@
+# 构建上下文只是 tests/，镜像只需要 requirements.txt：其余全排除。
+# 白名单写法，避免以后 tests/ 下新增目录时被无声带入镜像层。
+*
+!requirements.txt

@@ -8,10 +8,14 @@ backend_pom: backend/pom.xml            # mvn 的工作对象，同时决定 cla
 # 补丁版本不同就会产出不同字节，id 不一致的类被静默丢弃、报告显示 0 覆盖且不报错。
 # 2026-11-17 实测因此丢掉了整个 EmployeeService（49 行）。
 deploy:
-  ssh: root@106.12.144.134              # 能执行 docker exec 的目标；本机部署可留空并改用 --build
-  container: hr-backend
-  jar: /app/app.jar
-  classes_prefix: BOOT-INF/classes/     # Spring Boot 可执行 jar 内的应用类目录
+  mode: ssh                                 # ssh=本机驱动远端部署，现取（需免密）；file=CI/同机，只读 local_jar 落盘的部署产物
+  ssh: root@106.12.144.134                  # mode=ssh：能执行 docker exec 的目标；本机部署可留空并改用 --build
+  container: hr-backend                     # 容器名；mode=file 时只用于拼出错提示里的 docker cp 命令
+  jar: /app/app.jar                         # 容器内的可执行 jar 路径
+  classes_prefix: BOOT-INF/classes/         # Spring Boot 可执行 jar 内的应用类目录
+  local_jar: backend/target/deployed/app.jar  # mode=file：部署步骤落盘的同一份字节码，
+                                            #   docker cp hr-backend:/app/app.jar backend/target/deployed/app.jar
+                                            # 落盘而不是现取，是为了让 runner 容器不用挂 docker.sock（那等于交出宿主机 root）
 
 jacoco:
   version: "0.8.11"                     # 必须与 backend/pom.xml 的 jacoco-maven-plugin 版本一致
