@@ -191,6 +191,29 @@ pipeline {
             }
         }
 
+        stage('本次提交编译') {
+            steps {
+                sh '''
+                    # 为下一段的部署一致性断言准备"本次检出的字节码"。
+                    # 刻意编译到隔离副本而不是 backend/：门禁会用部署字节码覆盖 backend/target/classes，
+                    # 若在同一目录里编，下一轮构建的增量编译会因源码未变而跳过，
+                    # 于是"本次编译产物"其实是上一轮留下的部署 class，断言就变成自证通过的假象
+                    rm -rf .ci-verify
+                    mkdir -p .ci-verify
+                    cp -R backend/pom.xml backend/settings.xml backend/src .ci-verify/
+                    docker run --rm -e TZ=Asia/Shanghai \\
+                      -v "${WORKSPACE}/.ci-verify:/verify" \\
+                      -v "${MVN_LOCAL_REPO}:/root/.m2" \\
+                      -v "${WORKSPACE}/backend/settings.xml:/root/.m2/settings.xml:ro" \\
+                      "${RUNNER_IMAGE}" \\
+                      mvn -B -q -DskipTests compile -f /verify/pom.xml
+                    n=$(find .ci-verify/target/classes -name '*.class' | wc -l)
+                    echo "[编译] 本次检出编译出 ${n} 个 class"
+                    [ "${n}" -gt 0 ] || { echo "[编译] 没有产出任何 class，断言无从比对，先修编译"; exit 1; }
+                '''
+            }
+        }
+
         stage('覆盖率门禁') {
             steps {
                 sh '''
@@ -199,7 +222,8 @@ pipeline {
                       -v "${MVN_LOCAL_REPO}:/root/.m2" \
                       -v "${WORKSPACE}/backend/settings.xml:/root/.m2/settings.xml:ro" \
                       "${RUNNER_IMAGE}" \
-                      python3 tests/coverage_gate.py --deploy-mode "${DEPLOY_MODE}"
+                      python3 tests/coverage_gate.py --deploy-mode "${DEPLOY_MODE}" \
+                        --checkout-classes /workspace/.ci-verify/target/classes
                 '''
             }
         }
@@ -216,6 +240,8 @@ d = json.load(open("tests/reports/coverage/summary.json", encoding="utf-8"))
 meta, totals = d["meta"], d["totals"]
 print("[门禁] 字节码来源=%s 采集时间=%s pytest退出码=%s"
       % (meta["classes_source"], meta["captured_at"], meta["pytest_exit"]))
+print("[门禁] 部署一致性断言=%s（本次编译与部署逐文件比对的 class 数=%s）"
+      % (meta.get("checkout_verified"), meta.get("checkout_classes_checked")))
 for name in ("line", "branch", "method"):
     t = totals[name]
     print("       %-6s %d/%d = %s%%" % (name, t["covered"], t["total"], t["percent"]))

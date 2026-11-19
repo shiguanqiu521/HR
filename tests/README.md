@@ -220,6 +220,7 @@ cd D:\hr-system\tests
 .venv\Scripts\python.exe coverage_gate.py --update-thresholds    # 用实测值固化门禁下限（棘轮）
 .venv\Scripts\python.exe coverage_gate.py --keep-classes         # 复用上一轮的字节码重算（调试用，非结论）
 .venv\Scripts\python.exe coverage_gate.py --build                # 本地编译字节码（服务跑本机时的调试，非结论）
+.venv\Scripts\python.exe coverage_gate.py --checkout-classes DIR # 出报告前先断言"部署包 == 本次检出编译产物"
 ```
 
 **执行平面与流水线（"在哪跑"也要固化成产物）**
@@ -245,11 +246,17 @@ docker build -t hr-testrunner:$(git rev-parse --short HEAD) \
 ```bash
 # 每轮：先由部署步骤落盘字节码，再在 runner 容器里跑门禁（$WS 就是工作区，本机的 /root/HR 或 CI 的 workspace 都一样）
 docker cp hr-backend:/app/app.jar backend/target/deployed/app.jar
+# 编译本次检出的源码到隔离副本（不要在 backend/ 里编，原因见下节「部署一致性断言」）
+mkdir -p $WS/.ci-verify && cp -R backend/pom.xml backend/settings.xml backend/src $WS/.ci-verify/
+docker run --rm -v $WS/.ci-verify:/verify -v /home/runner/.m2:/root/.m2 \
+  -v $WS/backend/settings.xml:/root/.m2/settings.xml:ro \
+  hr-testrunner:latest mvn -B -q -DskipTests compile -f /verify/pom.xml
 docker run --rm --network host -e TZ=Asia/Shanghai \
   -v $WS:/workspace \
   -v /home/runner/.m2:/root/.m2 \
   -v $WS/backend/settings.xml:/root/.m2/settings.xml:ro \
-  hr-testrunner:latest python3 tests/coverage_gate.py --deploy-mode file
+  hr-testrunner:latest python3 tests/coverage_gate.py --deploy-mode file \
+    --checkout-classes /workspace/.ci-verify/target/classes
 ```
 
 - `--network host`：容器里 `127.0.0.1` 就是宿主回环，才能直连 8080 与只绑回环的 6300，不需要 SSH 隧道。
@@ -257,6 +264,10 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
   代价就是字节码不能现场 `docker exec` 取，改用 `deploy.mode=file` 读部署步骤落盘的 jar——权限与可信度都要保住。
 - maven 本地库用执行账号自己的目录（CI 用 `/home/runner/.m2`，本机手动跑用 `/root/.m2`）持久化。
   首轮要下载 jacoco 插件与 spring-boot parent，之后复用。
+  **注意一个静默坑（2026-11-19 实测）**：这台机器上 `/home/runner/.m2/settings.xml` 与 `/root/.m2/settings.xml` 都是
+  **0 字节文件**，整个目录挂进容器当 `/root/.m2` 会让 maven 直接 `Non-readable settings ... input contained no data` 失败。
+  流水线之所以能跑，是因为每条 `docker run` 都再用 `-v $WS/backend/settings.xml:/root/.m2/settings.xml:ro` 把它覆盖掉——
+  手动复跑时漏掉这个挂载就会得到一条与真实原因无关的报错。
 - `-e TZ=Asia/Shanghai`：镜像默认 UTC，不加则 `reports/coverage/<时间戳>` 目录名和 `summary.json.captured_at`
   比宿主时间早 8 小时（实测：不带 09:41 UTC，带了 17:41 CST）。
 - `deploy.mode` 默认仍是 `ssh`（本机驱动远端部署是对的），CI 用 `--deploy-mode file` 在命令行上覆盖，
@@ -282,6 +293,37 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 `summary.json.meta.classes_source` 会写明本轮用的是 `deployed-ssh` 还是 `deployed-file`，
 每轮报告都能自证字节码来源，不必靠人记。
 
+**部署一致性断言（`--checkout-classes`，2026-11-19 加）**
+
+门禁统计的是**部署**字节码，流水线声称验证的却是**本次检出**的提交；在"测环境上现装的包"这种形态下两者并不自动相等。
+2026-11-19 就实测到过偏离：CI 检出 `c8949ca`，服务器 `/root/HR` 停在 `3b88893`，容器里的 `app.jar` 更是 11-18 14:56
+构建的——只是那之后 `backend/` 恰好零改动（`git diff 3b88893 c8949ca -- backend/` 为空），数字才仍然成立。**绿灯是巧合，不是保证。**
+
+于是门禁在覆盖 `backend/target/classes` **之前**，把本次检出编译出的每个 `.class` 与部署包 `BOOT-INF/classes/**.class` 逐文件比 sha256：
+
+- 全等 → 打印「部署一致性断言通过（N 个 class 逐文件 sha256 相同）」，`summary.json.meta` 记 `checkout_verified=true` 与比对数；
+- 不一致 → 退出码 2，列出 `DIFF` / `ONLY-CHECKOUT` / `ONLY-DEPLOYED`，且**在跑用例与清零之前**就停，不留半轮脏计数；
+- 目录不存在或一个 `.class` 都没有 → 同样失败。断言不能因为「没编译」就默认通过，否则这条检查只是装饰；
+- 不给这个参数 → `checkout_verified=null`，报告末尾明说"数字属于环境上现装的包"。
+
+**为什么要编到 `.ci-verify/` 而不是 `backend/`**：门禁会用部署字节码覆盖 `backend/target/classes`。若就在 `backend/` 里编，
+下一轮 maven 增量编译会因源码未变、class 时间戳更新而**跳过重编**，"本次编译产物"其实是上一轮留下的部署 class，
+断言就变成拿部署字节码和自己比、永远为真。隔离副本每轮 `rm -rf` 重建，比的才是真编译结果。
+
+**为什么用字节码比对而不是"部署时往 jar 里写 commit 标签"**：标签依赖每次部署都有人记得传，漏一次就静默退化；
+字节码比对不需要任何人自觉，直接证明"环境里这份包就是这份源码编出来的"。代价是对构建环境敏感——
+**部署镜像与 runner 的 JDK 补丁版本不同时，会出现源码相同、字节不同的假红**。本项目 `backend/Dockerfile` 构建阶段与
+`tests/Dockerfile` 同为 `maven:3.9-eclipse-temurin-17`，2026-11-19 实测同镜像下 30 个 class 逐文件全等，
+所以选择宁可假红（安全）也不要假绿。
+
+拦截能力是在服务器上拿真实产物测出来的，不是构造的单测：
+
+| 场景 | 结果 |
+| --- | --- |
+| 改 `HealthController.java` 但不重新部署 | 拦住：`字节不同：1 个` + `DIFF com/hr/controller/HealthController.class` |
+| 新增类但不重新部署 | 拦住：`本次编译 31 个 class、部署 30 个` + `ONLY-CHECKOUT com/hr/CiProbeAddedClass.class` |
+| 未改动的本次检出（正向） | 通过：30 个 class 全等，`125 passed`，行 70.09% / 分支 70.00%，门禁通过；含编译整轮 14 秒 |
+
 **流水线形态（仓库根 `Jenkinsfile`）**
 
 调度器是 Jenkins 控制器（Windows 本机），执行平面是服务器上的 SSH agent（`cloud-server`，label `cloud`，
@@ -289,14 +331,15 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 
 | 阶段 | 干什么 | 失败时最先怀疑什么 |
 | --- | --- | --- |
-| Checkout | `retry(3)` 拉 master（这台机器到 github.com 偶发 TLS reset，实测 5 次 1 次失败） | 网络，不是代码 |
+| Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒） | 网络与解析，不是代码 |
 | 执行平面自检 | 验 docker 权限、agent 挂载、8080 有应答、6300 可达、`backend/settings.xml` 在位 | 没重连 agent（加组不重连等于没加）；后端没用 coverage overlay 重建 |
 | Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
 | 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
 | 接口用例 | 容器里跑 pytest 出 `tests/reports/junit.xml`，只为 JUnit 结果与趋势 | 用例本身；覆盖率不会因此算重（门禁首步清零并丢弃那次取数） |
 | 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID | 报告可信度的来源，日志里可追溯是哪份产物 |
-| 覆盖率门禁 | `coverage_gate.py --deploy-mode file`，未达标退出码 1 让构建变红 | 阈值回退 |
-| post | `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source` 与三项实测值 | — |
+| 本次提交编译 | 把 `backend/{pom.xml,settings.xml,src}` 拷到 `.ci-verify/` 隔离副本，容器里 `mvn -DskipTests compile`，产出 class 数必须 > 0 | 本次检出的源码编译不过（与部署无关，先看代码）；或 maven 本地库缺插件导致在线下载失败 |
+| 覆盖率门禁 | `coverage_gate.py --deploy-mode file --checkout-classes /workspace/.ci-verify/target/classes`：先做部署一致性断言，再判阈值；不一致退出码 2、未达标退出码 1 | 断言报红 = 后端改了没重新部署（照提示 `up -d --build backend`），不是覆盖率掉了 |
+| post | `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source`、`checkout_verified` 与三项实测值 | — |
 
 建 job：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
 `https://github.com/shiguanqiu521/HR.git`、Branch `master`、Script Path `Jenkinsfile`（仓库公开，无需凭据；

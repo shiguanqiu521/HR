@@ -1,5 +1,7 @@
 # Java / Maven
 backend/target/
+# CI 里为部署一致性断言编译本次检出的隔离副本（Jenkinsfile 的「本次提交编译」段）
+.ci-verify/
 *.class
 *.jar
 *.war

@@ -37,6 +37,7 @@ CI / 与被测服务同机执行时走 runner 镜像（tests/Dockerfile）+ --de
 """
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
@@ -72,6 +73,10 @@ def parse_args():
     parser.add_argument("--deploy-mode", choices=["ssh", "file"], default=None,
                         help="覆盖 config/coverage.yml 的 deploy.mode：CI/与被测服务同机用 file（读落盘 jar），"
                              "本机驱动远端用 ssh。避免为切通道再维护一份配置副本")
+    parser.add_argument("--checkout-classes", default=None, metavar="DIR",
+                        help="本次检出源码编译出的 class 目录（如 backend/target/classes）。"
+                             "给出后即做部署一致性断言：逐文件比对部署字节码与本次编译产物，"
+                             "不一致就拒绝判定通过，防止流水线声称验证了提交 X 却统计了环境上残留的包 Y")
     parser.add_argument("--dump-host", default=None, help="覆盖配置里的 tcpserver 地址")
     parser.add_argument("--dump-port", type=int, default=None, help="覆盖配置里的 tcpserver 端口")
     parser.add_argument("--update-thresholds", action="store_true",
@@ -346,7 +351,70 @@ def _classes_from_local_jar(deploy, root):
     return entries
 
 
-def sync_deployed_classes(cfg):
+def verify_checkout_classes(entries, checkout_dir):
+    """部署一致性断言：本次检出编译出的字节码，是否与环境里正在跑的那份逐文件相同
+
+    覆盖率统计的是部署字节码，而流水线声称验证的是本次检出的提交。
+    两者不一致时，报告数字与本次提交无关，绿灯只是巧合，必须拒绝判定。
+
+    Args:
+        entries: [(class 相对路径, 部署字节内容)]，取回通道刚读到的那份
+        checkout_dir: 本次检出源码编译出的 class 目录
+
+    Returns:
+        dict: {'checked': 比对类数, 'identical': 是否全等}
+
+    Raises:
+        EnvironmentError: 目录缺失/没有 class（断言无法成立），或字节码与部署不一致
+    """
+    if not os.path.isdir(checkout_dir):
+        raise EnvironmentError(
+            f"部署一致性断言要求先编译本次检出，目录不存在：{checkout_dir}\n"
+            "  mvn -B -DskipTests compile（产物在 backend/target/classes）\n"
+            "断言不能因为「没编译」就默认通过，那样这条检查只是装饰")
+
+    built = {}
+    for dirpath, _, files in os.walk(checkout_dir):
+        for name in files:
+            if name.endswith(".class"):
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, checkout_dir).replace(os.sep, "/")
+                with open(path, "rb") as fh:
+                    built[rel] = hashlib.sha256(fh.read()).hexdigest()
+    if not built:
+        raise EnvironmentError(
+            f"{checkout_dir} 里没有任何 .class，断言无法成立\n"
+            "  确认 mvn compile 真的跑成功（不是 -q 掩盖的失败），且目录指向 backend/target/classes 而不是 target")
+
+    deployed = {rel: hashlib.sha256(data).hexdigest() for rel, data in entries}
+    diff = sorted(r for r in set(built) & set(deployed) if built[r] != deployed[r])
+    only_built = sorted(set(built) - set(deployed))
+    only_deployed = sorted(set(deployed) - set(built))
+
+    if not (diff or only_built or only_deployed):
+        print(f"        部署一致性断言通过：本次编译与部署字节码全等（{len(built)} 个 class 逐文件 sha256 相同）")
+        return {"checked": len(built), "identical": True}
+
+    lines = [
+        f"部署字节码与本次检出不一致：本次编译 {len(built)} 个 class、部署 {len(deployed)} 个",
+        f"  字节不同：{len(diff)} 个；只在本次检出里有：{len(only_built)} 个；只在部署包里有：{len(only_deployed)} 个",
+    ]
+    for label, items in (("DIFF", diff), ("ONLY-CHECKOUT", only_built), ("ONLY-DEPLOYED", only_deployed)):
+        for rel in items[:8]:
+            lines.append(f"  {label} {rel}")
+        if len(items) > 8:
+            lines.append(f"  {label} ...另有 {len(items) - 8} 个")
+    lines += [
+        "在这种前提下覆盖率数字描述的是环境上残留的那个包，不是本次提交，门禁拒绝判定通过。两种处置：",
+        "  1) 重新部署本次提交（正解）：mvn -B -DskipTests package && "
+        "docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d --build backend",
+        "  2) 本轮只想验证环境现状：去掉 --checkout-classes 复跑，"
+        "summary.json 里会记下「未做一致性校验」，汇报时不能说成「本次提交已验证」",
+    ]
+    raise EnvironmentError("\n".join(lines))
+
+
+def sync_deployed_classes(cfg, checkout_dir=None):
     """用实际执行的字节码覆盖 backend/target/classes，取回通道由 deploy.mode 决定
 
     这是让报告可信的关键一步：jacoco:report 只能读 backend/target/classes，
@@ -354,12 +422,13 @@ def sync_deployed_classes(cfg):
 
     Args:
         cfg: 配置字典
+        checkout_dir: 可选，本次检出编译产物目录；给出即在覆盖前做部署一致性断言
 
     Returns:
         int: 同步到本地的 class 文件数
 
     Raises:
-        EnvironmentError: deploy.mode 不认识，或对应通道取不到字节码
+        EnvironmentError: deploy.mode 不认识，或对应通道取不到字节码，或一致性断言不成立
     """
     deploy = cfg.get("deploy") or {}
     mode = deploy.get("mode", "ssh")
@@ -370,6 +439,10 @@ def sync_deployed_classes(cfg):
         entries = _classes_from_local_jar(deploy, root)
     else:
         raise EnvironmentError(f"未知的 deploy.mode={mode!r}，可选 ssh（远端现取）/ file（读落盘 jar）")
+
+    # 必须在覆盖 backend/target/classes 之前比对：覆盖之后两边就是同一份数据，断言会自证通过
+    if checkout_dir:
+        cfg["_checkout_verify"] = verify_checkout_classes(entries, checkout_dir)
 
     classes_dir = cfg["_classes_dir"]
     shutil.rmtree(classes_dir, ignore_errors=True)
@@ -587,6 +660,10 @@ def main():
     print(f"覆盖率采集通道：{host}:{port}（JaCoCo tcpserver）")
 
     classes_source = "keep"
+    if args.checkout_classes and (args.build or args.keep_classes):
+        print("--checkout-classes 不能与 --build / --keep-classes 同时使用："
+              "后两者根本不去读部署字节码，没有可比对的对象，断言会失去意义")
+        return 2
     if args.keep_classes:
         print("\n[准备] 沿用现有 backend/target/classes（--keep-classes）")
     elif args.build:
@@ -596,9 +673,10 @@ def main():
         classes_source = "local-build"
     else:
         mode = (cfg.get("deploy") or {}).get("mode", "ssh")
-        print(f"\n[准备] 取回运行中的字节码（deploy.mode={mode}）")
+        extra = f"，并做部署一致性断言：{args.checkout_classes}" if args.checkout_classes else ""
+        print(f"\n[准备] 取回运行中的字节码（deploy.mode={mode}）{extra}")
         try:
-            classes = sync_deployed_classes(cfg)
+            classes = sync_deployed_classes(cfg, checkout_dir=args.checkout_classes)
         except Exception as exc:
             print(f"取回失败：{exc}")
             print("没有一致的字节码就无法出报告：修好取回通道后再复跑，"
@@ -659,6 +737,9 @@ def main():
         {"env": args.env, "host": host, "port": port, "driver": "check-only" if args.check_only else "pytest",
          "keyword": args.keyword, "marker": args.marker, "pytest_exit": pytest_exit,
          "classes_source": classes_source,
+         # 区分「断言做过且通过」与「压根没做」，None 就是没做，不能被读成通过
+         "checkout_verified": cfg.get("_checkout_verify", {}).get("identical") if args.checkout_classes else None,
+         "checkout_classes_checked": cfg.get("_checkout_verify", {}).get("checked") if args.checkout_classes else None,
          "captured_at": datetime.now().isoformat(timespec="seconds")})
     print(f"\nHTML 报告：{archived_html}")
     print(f"最新报告：{os.path.join(cfg['gate']['_output_dir'], 'latest', 'index.html')}")
@@ -669,6 +750,9 @@ def main():
 
     print("\n门禁判定：" + ("通过" if passed else "不通过"))
     print(verdict)
+    if not args.checkout_classes and not (args.build or args.keep_classes):
+        print("提示：本轮未做部署一致性断言（--checkout-classes），"
+              "上面的数字属于环境上现装的那个包，不等于本次提交已通过验证")
     if pytest_exit != 0:
         print("提示：本轮存在未通过用例，覆盖率不能作为质量结论，先按失败归因处理用例再复测")
     return 0 if passed else 1
