@@ -56,10 +56,16 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                // 这台机器到 github.com 偶发 TLS reset（实测 5 次里 1 次失败，成功耗时 3~12s），
-                // 所以重试而不换第三方镜像：Jenkinsfile 本身会经由此通道下发，不该让镜像站碰凭据链路
+                // 百度内网 DNS 把 github.com 解析到 20.6.7.17，该地址只回 refs、传不了 pack，
+                // 表现为 fetch 挂死后被 SIGTERM。已在服务器 /etc/hosts 固定为实测可用的 140.82.112.4。
+                // 跨境链路全量 clone 实测 56~65s，这里显式给 5 分钟超时，不依赖 job 里的 Advanced Clone behaviours 取值。
                 retry(3) {
-                    checkout scm
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: scm.branches,
+                        extensions: scm.extensions + [[$class: 'CloneOption', timeout: 5]],
+                        userRemoteConfigs: scm.userRemoteConfigs
+                    ])
                 }
                 sh 'git log -1 --format="构建的提交：%h %ad %s" --date=iso'
             }
