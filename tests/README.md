@@ -370,7 +370,7 @@ project（工作区目录叫 `hr-api-coverage-gate`），于是它新建了 `hr-
 | 修复 | 位置 | 实测 |
 | --- | --- | --- |
 | 顶层 `environment { COMPOSE_PROJECT = "${params.COMPOSE_PROJECT ?: 'hr'}" }` 显式兜底 | `options` 之后 | — |
-| 自检段遍历"只在 shell 里用"的五个参数，空值立刻停并给处置办法 | `执行平面自检` | 复刻 #11 的参数集（缺 `COMPOSE_PROJECT`）→ 退出码 1；补上 → 放行 |
+| 自检段对"只在 shell 里用"的五个参数逐个显式判空，空值立刻停并给处置办法 | `执行平面自检` | 复刻 #11 的参数集（缺 `COMPOSE_PROJECT`）→ 退出码 1；补上 → 放行 |
 | **project 归属以运行中的容器为准**：`docker inspect` 读 `com.docker.compose.project` 标签，与要用的 `-p` 不符就停在 `up` 之前 | `部署本次提交` | `hr` → 放行；空值与 `hr-test` → 都拦下，并说明"继续会另起一套空库卷" |
 
 第三条是关键：参数对不对，不看配置、看**被测容器身上写的归属**。否则一次填错就能让 125 条用例在空库上跑完，
@@ -392,6 +392,40 @@ docker volume rm <卷名...> && docker network rm <网络名> && docker rmi <错
 顺带消掉一个口径歧义：`PasswordHasher.<clinit>` 那 +1 行只在"重启后的第一次登录落在测量窗口内"时才记为已覆盖，
 而探活的这次登录发生在门禁清零**之前**，所以无论容器重建与否，门禁量到的都是稳态的 321/458 = 70.09%。
 
+**#15 踩中的坑：`sh` 步骤的解释器不是 bash，是 dash（2026-11-19）**
+
+#15 在第 2 段就停了，日志只有一行有用的：
+
+```
+/home/runner/workspace/hr-api-coverage-gate@tmp/durable-.../script.sh.copy: 14: Bad substitution
+```
+
+第 14 行是上一节为修 #11 加的参数判空循环，写的是 `eval "val=${$v:-}"`（用变量名取变量值）。
+服务器上 `/bin/sh -> dash`，而 **dash 没有 `${!name}`、也没有 `${$name}` 这种间接展开**。Jenkins 的 `sh` 步骤
+用的就是 `/bin/sh`，所以整块直接报错。三条这次一起踩出来的教训：
+
+1. **`sh -n` 和本机 bash 都抓不到这类错**。本机 Git Bash 的 `bash -n` 通过；更反直觉的是
+   **`dash -n` 也通过** —— 因为 `${$v:-}` 不是语法错，是**展开期**错误，`-n` 只解析不执行。
+   要抓它只有一条路：**用 dash 真跑一遍**。
+2. **校验方法（可复用，跨项目同样适用）**：把 Jenkinsfile 里的 `sh '''…'''` 块原样取出塞给 Groovy
+   自己的词法器解串（别手搓转义规则：`\\` 才是续行，`\` + 换行会被 Groovy 吃掉换行），
+   然后在**临时工作区 + 桩 PATH**（`docker`/`curl`/`mvn`/`python3`/`bash`/`sleep` 全部替身）下逐块
+   `sh -x` 跑。这样既覆盖到展开期，又不碰被测服务。判定看两点：解释器不得报 `Bad substitution`/
+   `not found`/语法错，且成功路径模式下每块必须跑到最后（rc=0）——否则说明有的分支从没被执行过。
+   这套校验的**有效性是反证过的**：拿 #15 那版（改前）跑，它精确复现了 `14: Bad substitution`，
+   行号与 Jenkins 日志一致；拿改后版本跑，10 块在 dash 下全部跑到最后，成功/失败两种桩各一轮。
+3. **写进规约**：Jenkinsfile 的 `sh` 块按 POSIX sh 写。需要 bash 特性（`/dev/tcp`、数组、`${var//}`、
+   间接展开）时**显式 `bash -c '…'`**，别让它们混在默认解释器里 —— 部署段的 6300 探活就是这么写的，
+   所以它没事，而判空循环那么写就红了。
+
+另外 #12、#13、#14 三次红与流水线代码无关：这个 job 的 `<lightweight>true</lightweight>`，
+**取 Jenkinsfile 这一步发生在 Windows 控制器上**（日志里能看到 `C:\Program Files\Git\bin\git.exe fetch`），
+控制器到 github.com 链路本来就抖，三次都是 `Recv failure: Connection was reset`，且都发生在
+`Start of Pipeline` 之前 —— agent 没参与、工作区没动。第 4 次点就过去了。
+要根治得改 job 配置（关掉 Lightweight checkout），但它会把取回变成一次完整 checkout、
+**这一步落在控制器还是 agent 上我还没实测**，所以先不写成结论；观察到的事实是：一次红就重跑，
+连续多次红再来动这个开关。
+
 **流水线形态（仓库根 `Jenkinsfile`）**
 
 调度器是 Jenkins 控制器（Windows 本机），执行平面是服务器上的 SSH agent（`cloud-server`，label `cloud`，
@@ -400,7 +434,7 @@ docker volume rm <卷名...> && docker network rm <网络名> && docker rmi <错
 | 阶段 | 干什么 | 失败时最先怀疑什么 |
 | --- | --- | --- |
 | Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒）；末尾 `touch tests/logs/.build-start` 作为本轮产物时间基准 | 网络与解析，不是代码 |
-| 执行平面自检 | 验 docker 权限、**五个"只在 shell 里用"的参数非空**、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 参数空值（新增参数没进 `environment{}` 兜底，见下节 #11）；没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
+| 执行平面自检 | 验 docker 权限、**五个"只在 shell 里用"的参数逐个非空**、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 参数空值（新增参数没进 `environment{}` 兜底，见上节 #11）；块里混进 bash 写法（`sh` 步骤的解释器是 dash，见上节 #15）；没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
 | Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
 | 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
 | 部署本次提交 | 先读运行中容器的 `com.docker.compose.project` 标签和 `COMPOSE_PROJECT` 核对（不一致立刻停，不进 `up`）；三条凭据以环境变量注入 compose，`-p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend`；再验 6300 可达、并用 `/api/auth/login` 拿到 token 当就绪判据 | `project` 名不对（会得到一套空库的新栈，归属核对就是拦这个的）；凭据值与运行中 mysql/redis 不一致（后端连不上库，探活转满 120 秒后打容器 ERROR 行）；`--build` 失败看 `tests/logs/deploy.log` |

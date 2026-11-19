@@ -111,21 +111,25 @@ pipeline {
                     echo "[自检] docker server $(docker version --format '{{.Server.Version}}')"
 
                     # 参数在 shell 里取到空值 = 本轮参数表里还没有它（新加参数的第一轮构建必踩，#11 实证：
-                    # -p 传空 → compose 按目录名推导 project → 另建一套空库卷）。在这里停，别让它往下走
-                    params_line=""
-                    for v in RUNNER_IMAGE DEPLOY_MODE MVN_LOCAL_REPO BACKEND_CONTAINER COMPOSE_PROJECT; do
-                        eval "val=\${$v:-}"
-                        if [ -z "${val}" ]; then
-                            echo "[自检] 参数 ${v} 在 shell 里是空值。Jenkins 只把「本次构建参数表里已有的」参数导成"
-                            echo "       环境变量，新增参数的第一轮构建拿不到它（Groovy 的 params.X 却有默认值，"
-                            echo "       所以只在 shell 里用的那种才会中招）。处置二选一："
-                            echo "       1) Build with Parameters 里显式填一次 ${v}，再重跑；"
-                            echo "       2) 在顶部 environment{} 里给它兜底（COMPOSE_PROJECT 已经是这么修的）"
-                            exit 1
-                        fi
-                        params_line="${params_line} ${v}=${val}"
-                    done
-                    echo "[自检] 参数齐备：${params_line}"
+                    # -p 传空 → compose 按目录名推导 project → 另建一套空库卷）。在这里停，别让它往下走。
+                    # 只能逐个显式判断：sh 步骤跑的是 /bin/sh，Ubuntu 上那是 dash，
+                    # dash 没有 ${!name} 也没有 ${$name} 的间接展开，#15 就是被 "Bad substitution" 停在解析阶段
+                    missing=""
+                    [ -n "${RUNNER_IMAGE:-}" ]      || missing="${missing} RUNNER_IMAGE"
+                    [ -n "${DEPLOY_MODE:-}" ]       || missing="${missing} DEPLOY_MODE"
+                    [ -n "${MVN_LOCAL_REPO:-}" ]    || missing="${missing} MVN_LOCAL_REPO"
+                    [ -n "${BACKEND_CONTAINER:-}" ] || missing="${missing} BACKEND_CONTAINER"
+                    [ -n "${COMPOSE_PROJECT:-}" ]   || missing="${missing} COMPOSE_PROJECT"
+                    if [ -n "${missing}" ]; then
+                        echo "[自检] 这些参数在 shell 里是空值：${missing}"
+                        echo "       Jenkins 只把「本次构建参数表里已有的」参数导成环境变量，新增参数在被注册之前的那一轮拿不到它。"
+                        echo "       Groovy 侧 params.X 会退回 parameters{} 的默认值，所以两条凭据 ID 看着正常、中招的总是只在 shell 里用的那种。"
+                        echo "       处置二选一：1) Build with Parameters 里显式填一次再重跑；"
+                        echo "                   2) 在顶部 environment{} 里兜底（COMPOSE_PROJECT 已经是这么修的）"
+                        exit 1
+                    fi
+                    echo "[自检] 参数齐备：RUNNER_IMAGE=${RUNNER_IMAGE} DEPLOY_MODE=${DEPLOY_MODE}"
+                    echo "[自检]            MVN_LOCAL_REPO=${MVN_LOCAL_REPO} BACKEND_CONTAINER=${BACKEND_CONTAINER} COMPOSE_PROJECT=${COMPOSE_PROJECT}"
 
                     # 数据服务不归本流水线管（部署段只 --no-deps 重建 backend），所以缺了必须在这里就说清。
                     # 否则要等部署段的登录探活转满 120 秒才失败，报出来的还是"后端没就绪"这种误导性结论
