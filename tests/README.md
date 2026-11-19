@@ -73,6 +73,7 @@ tests/
 | dev 实测（2026-11-18 上午，补 4 条 `TC-META-*` 后同轮） | 22 | 76 | 30 | **128 passed / 0 failed / 0 skipped**，23.46s（该 4 条已于同日接口收敛时删除） |
 | dev 实测（2026-11-18 下午，接口收敛后重建部署、覆盖率门禁同轮） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，26.15s |
 | runner 容器内实测（2026-11-18 晚，与被测后端同机） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，4.30s（同轮覆盖率见下节，与本地逐字相同） |
+| Jenkins 执行平面预检（2026-11-19，`runner` 非 root + docker 组，`--deploy-mode file`） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，4.55s（JUnit 段）+ 4.20s（门禁同轮），行 70.09% 与基线逐字相同 |
 
 - 用例表：`../HR系统测试用例.xlsx`（功能测试 121 行 = 93 有效 + 19 已删除标注行；有效用例变更类型分布 修改 48 / 新增 16 / 不变 29），逐条变更记录见「用例变更记录」sheet（95 条）。
 - `TC-AUTH-014`（过期 token 本地自签）已在 `config/.env.dev` 填入与服务端一致的 `HR_JWT_SECRET` 后转执行，2026-11-17 实测通过，无 skipped。
@@ -242,27 +243,31 @@ docker build -t hr-testrunner:$(git rev-parse --short HEAD) \
 报的是 `Could not find a version ... (from versions: none)`，看不出真实原因是索引被跳过（2026-11-18 实测踩过）。
 
 ```bash
-# 每轮：先由部署步骤落盘字节码，再在 runner 容器里跑门禁
+# 每轮：先由部署步骤落盘字节码，再在 runner 容器里跑门禁（$WS 就是工作区，本机的 /root/HR 或 CI 的 workspace 都一样）
 docker cp hr-backend:/app/app.jar backend/target/deployed/app.jar
-sed 's/^  mode: ssh/  mode: file/' tests/config/coverage.yml > tests/logs/coverage.ci.yml
 docker run --rm --network host -e TZ=Asia/Shanghai \
-  -v /root/HR:/workspace \
-  -v /root/.m2:/root/.m2 \
-  -v /root/HR/backend/settings.xml:/root/.m2/settings.xml:ro \
-  hr-testrunner:latest python3 tests/coverage_gate.py --config tests/logs/coverage.ci.yml
+  -v $WS:/workspace \
+  -v /home/runner/.m2:/root/.m2 \
+  -v $WS/backend/settings.xml:/root/.m2/settings.xml:ro \
+  hr-testrunner:latest python3 tests/coverage_gate.py --deploy-mode file
 ```
 
 - `--network host`：容器里 `127.0.0.1` 就是宿主回环，才能直连 8080 与只绑回环的 6300，不需要 SSH 隧道。
 - **不挂 `/var/run/docker.sock`**：那等于把宿主机 root 交给测试通道（这台机器的 3306 曾被公网打穿过，见评审记录）。
   代价就是字节码不能现场 `docker exec` 取，改用 `deploy.mode=file` 读部署步骤落盘的 jar——权限与可信度都要保住。
-- `-v /root/.m2`：maven 本地库持久化。首轮要下载 jacoco 插件与 spring-boot parent，之后复用。
+- maven 本地库用执行账号自己的目录（CI 用 `/home/runner/.m2`，本机手动跑用 `/root/.m2`）持久化。
+  首轮要下载 jacoco 插件与 spring-boot parent，之后复用。
 - `-e TZ=Asia/Shanghai`：镜像默认 UTC，不加则 `reports/coverage/<时间戳>` 目录名和 `summary.json.captured_at`
   比宿主时间早 8 小时（实测：不带 09:41 UTC，带了 17:41 CST）。
-- `deploy.mode` 默认仍是 `ssh`（本机驱动远端部署是对的），CI 用 `file`。上面用 `--config` 指到 gitignored 副本，
-  是为了不改仓库里的默认值；正式形态倾向给门禁加 `--deploy-mode` 参数，而不是长期维护第二份 yml。
-- 服务器侧 `tests/config/.env.dev` 不在版本库里（`.gitignore:31`），首跑要单独准备并 `chmod 600`，
-  并把 `HR_BASE_URL` 改成 `http://127.0.0.1:8080`（同机执行不必绕公网）。缺这个文件时 `switch_env("dev")`
-  直接抛 `FileNotFoundError`，pytest 一条也收集不到——这是"环境文件不入版本库"必然要付的准备成本。
+- `deploy.mode` 默认仍是 `ssh`（本机驱动远端部署是对的），CI 用 `--deploy-mode file` 在命令行上覆盖，
+  不为切通道维护第二份 yml（早期用 `sed` 生成 `tests/logs/coverage.ci.yml` 的写法已废弃）。
+- 执行平面的账号**不需要 root，但需要 docker 组成员身份**（`usermod -aG docker runner`）。
+  组成员身份在登录时分配，加组后必须重连 agent/重新登录才生效——这是最容易误判成"权限没加上"的坑。
+  诚实说明：docker 组等价于宿主 root，真正的隔离需要第二台构建机，这台机器既是生产又是被测环境，做不到。
+- CI 里 `tests/config/.env.dev` 由**凭据现场生成**（`.gitignore:31` 决定了它不进版本库）：
+  `withCredentials` 注入 `hr-api-admin`（Username/Password）与 `hr-jwt-secret`（Secret text），
+  以 `umask 077` 写进工作区，日志里只打印键名与值长度。缺这个文件时 `switch_env("dev")` 直接抛
+  `FileNotFoundError`，pytest 一条也收集不到；`HR_JWT_SECRET` 为空则 `TC-AUTH-014` 按条件跳过，基线少一条用例。
 
 **两个平面的等价性实测（2026-11-18 晚，同一部署、同一用例集）**
 
@@ -276,6 +281,29 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 说明这个数字不是某台机器的偶然；容器侧快 5 倍是网络往返的差，与覆盖无关。
 `summary.json.meta.classes_source` 会写明本轮用的是 `deployed-ssh` 还是 `deployed-file`，
 每轮报告都能自证字节码来源，不必靠人记。
+
+**流水线形态（仓库根 `Jenkinsfile`）**
+
+调度器是 Jenkins 控制器（Windows 本机），执行平面是服务器上的 SSH agent（`cloud-server`，label `cloud`，
+非 root 的 `runner` 账号）。阶段与用途：
+
+| 阶段 | 干什么 | 失败时最先怀疑什么 |
+| --- | --- | --- |
+| Checkout | `retry(3)` 拉 master（这台机器到 github.com 偶发 TLS reset，实测 5 次 1 次失败） | 网络，不是代码 |
+| 执行平面自检 | 验 docker 权限、agent 挂载、8080 有应答、6300 可达、`backend/settings.xml` 在位 | 没重连 agent（加组不重连等于没加）；后端没用 coverage overlay 重建 |
+| Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
+| 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
+| 接口用例 | 容器里跑 pytest 出 `tests/reports/junit.xml`，只为 JUnit 结果与趋势 | 用例本身；覆盖率不会因此算重（门禁首步清零并丢弃那次取数） |
+| 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID | 报告可信度的来源，日志里可追溯是哪份产物 |
+| 覆盖率门禁 | `coverage_gate.py --deploy-mode file`，未达标退出码 1 让构建变红 | 阈值回退 |
+| post | `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source` 与三项实测值 | — |
+
+建 job：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
+`https://github.com/shiguanqiu521/HR.git`、Branch `master`、Script Path `Jenkinsfile`（仓库公开，无需凭据；
+不用 `gh-proxy` 之类第三方镜像，因为 Jenkinsfile 本身经此通道下发并会持有凭据，不该让镜像站进这条链路）。
+两个刻意设定：**`disableConcurrentBuilds()`**——JaCoCo 计数器是被测 JVM 里的一份全局状态，并发构建会互相清零；
+**不开 `cleanWs()`**——容器内 root 在 gitignore 目录里留下 0644 产物，runner 读得到（归档正常）但删不掉，
+工作区一清就让构建无故变红。
 
 **输出**
 - 终端：按包的行/分支/方法覆盖率表 + 合计 + 门禁判定，未达标退出码 1（可直接接 CI）

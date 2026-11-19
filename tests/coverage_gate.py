@@ -12,8 +12,9 @@
     ./.venv/Scripts/python.exe coverage_gate.py --check-only     # 不跑用例，只读上一轮清零之后新跑到的代码
     ./.venv/Scripts/python.exe coverage_gate.py --update-thresholds   # 用本轮实测值刷新门禁阈值（棘轮）
 
-CI / 与被测服务同机执行时走 runner 镜像（tests/Dockerfile）+ deploy.mode=file，
-命令形态见 tests/README.md「执行平面与流水线」——那条通道不需要 ssh 免密，也不需要 docker 权限。
+CI / 与被测服务同机执行时走 runner 镜像（tests/Dockerfile）+ --deploy-mode file，
+命令形态见仓库根的 Jenkinsfile 与 tests/README.md「执行平面与流水线」——
+那条通道不需要 ssh 免密，也不需要给执行容器 docker 权限。
 
 字节码口径（决定数字是否可信）：
     默认在出报告前取回运行中的 BOOT-INF/classes 覆盖 backend/target/classes，
@@ -68,6 +69,9 @@ def parse_args():
                              "仅适用于本机直连部署的调试；JDK 补丁版本与构建镜像不一致时会静默丢类")
     parser.add_argument("--keep-classes", action="store_true",
                         help="不刷新 backend/target/classes，直接用现有内容出报告（同一轮复算用）")
+    parser.add_argument("--deploy-mode", choices=["ssh", "file"], default=None,
+                        help="覆盖 config/coverage.yml 的 deploy.mode：CI/与被测服务同机用 file（读落盘 jar），"
+                             "本机驱动远端用 ssh。避免为切通道再维护一份配置副本")
     parser.add_argument("--dump-host", default=None, help="覆盖配置里的 tcpserver 地址")
     parser.add_argument("--dump-port", type=int, default=None, help="覆盖配置里的 tcpserver 端口")
     parser.add_argument("--update-thresholds", action="store_true",
@@ -574,6 +578,8 @@ def main():
     setup_stdout()
     args = parse_args()
     cfg = load_config(args.config)
+    if args.deploy_mode:
+        cfg.setdefault("deploy", {})["mode"] = args.deploy_mode
     host = args.dump_host or cfg["jacoco"]["dump"]["host"]
     port = args.dump_port or cfg["jacoco"]["dump"]["port"]
     exec_file = cfg["jacoco"]["_exec_file"]
