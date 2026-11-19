@@ -317,15 +317,28 @@ pipeline {
                     # 刻意编译到隔离副本而不是 backend/：门禁会用部署字节码覆盖 backend/target/classes，
                     # 若在同一目录里编，下一轮构建的增量编译会因源码未变而跳过，
                     # 于是"本次编译产物"其实是上一轮留下的部署 class，断言就变成自证通过的假象
-                    rm -rf .ci-verify
+                    # 容器里的 mvn 以 root 写 /verify，本轮之后 host 侧的 runner 就删不掉那份 target。
+                    # #16 正是停在这里：rm -rf 打出 35 行 Permission denied 后退出码 1。
+                    # 收尾 chown 是常规路径；下面的兜底处理"构建被 timeout 打断、chown 没跑到"那一轮，
+                    # 它留下的还是 root 属主，只有容器内的 root 删得掉
+                    rm -rf .ci-verify 2>/dev/null
+                    if [ -e .ci-verify ]; then
+                        echo "[编译] .ci-verify 里有 root 属主残留（历轮容器写入、收尾 chown 没跑到），用容器内的 root 清一次"
+                        docker run --rm -v "${WORKSPACE}:/ws" "${RUNNER_IMAGE}" sh -c 'rm -rf /ws/.ci-verify'
+                    fi
+                    if [ -e .ci-verify ]; then
+                        echo "[编译] 还是删不掉，在服务器上手工执行后重跑：sudo rm -rf ${WORKSPACE}/.ci-verify"
+                        exit 1
+                    fi
                     mkdir -p .ci-verify
                     cp -R backend/pom.xml backend/settings.xml backend/src .ci-verify/
                     docker run --rm -e TZ=Asia/Shanghai \\
+                      -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
                       -v "${WORKSPACE}/.ci-verify:/verify" \\
                       -v "${MVN_LOCAL_REPO}:/root/.m2" \\
                       -v "${WORKSPACE}/backend/settings.xml:/root/.m2/settings.xml:ro" \\
                       "${RUNNER_IMAGE}" \\
-                      mvn -B -q -DskipTests compile -f /verify/pom.xml
+                      sh -c 'mvn -B -q -DskipTests compile -f /verify/pom.xml; rc=$?; chown -R "${HOST_UID}:${HOST_GID}" /verify; exit $rc'
                     n=$(find .ci-verify/target/classes -name '*.class' | wc -l)
                     echo "[编译] 本次检出编译出 ${n} 个 class"
                     [ "${n}" -gt 0 ] || { echo "[编译] 没有产出任何 class，断言无从比对，先修编译"; exit 1; }

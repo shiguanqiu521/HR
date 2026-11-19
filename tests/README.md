@@ -418,7 +418,38 @@ docker volume rm <卷名...> && docker network rm <网络名> && docker rmi <错
    间接展开）时**显式 `bash -c '…'`**，别让它们混在默认解释器里 —— 部署段的 6300 探活就是这么写的，
    所以它没事，而判空循环那么写就红了。
 
-另外 #12、#13、#14 三次红与流水线代码无关：这个 job 的 `<lightweight>true</lightweight>`，
+**#16 踩中的坑：容器以 root 往工作区写，下一轮的 `rm -rf` 就删不动了（2026-11-19）**
+
+#15 的 dash 问题修好后，构建一路走到了第 8 段（部署段第一次真跑：`Container hr-backend Recreated`、
+新镜像 `8bb3b5985a3f`、6300 可达、登录第 6 次探测拿到 token、`125 passed in 7.72s`），
+然后死在「本次提交编译」段的**第一行**：
+
+```
+rm: cannot remove '.ci-verify/target/classes/com/hr/...': Permission denied   × 35
+ERROR: script returned exit code 1
+```
+
+根因与流水线逻辑无关，是**属主**：`mvn` 在容器里是 root，产出直接写进宿主挂载的 `.ci-verify/target`，
+于是那份 `target` 是 `root:root`；下一轮构建的 `rm -rf .ci-verify` 由 agent 的 `runner` 执行，
+删不掉别人属主的目录。**这不是偶发，是结构性的——不改写法每一轮都会红在同一个地方。**
+同一类残留在工作区里还有几处（`logs/`、`tests/reports/coverage`、`backend/target/classes`、各处 `__pycache__`），
+区别只在于流水线从不从宿主侧删它们，所以照跑不误（也就是下一节"不开 `cleanWs()`"的原因）。
+
+改法是在**产生残留的那一步**收尾，而不是绕开删除：
+
+| 改动 | 作用 |
+| --- | --- |
+| `docker run` 加 `-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)"`，容器命令包成 `sh -c 'mvn …; rc=$?; chown -R "$HOST_UID":"$HOST_GID" /verify; exit $rc'` | 编译产物回到 `runner` 名下；`rc` 先存再 chown，编译失败也照样把属主还回去、且**不吞掉失败退出码**（不能为了让下一轮能删而把这一轮的红洗成绿） |
+| `rm -rf` 加 `2>/dev/null`，之后 `[ -e .ci-verify ]` 判在不在，还在就用容器内的 root 清一次 | 处理"构建被 `timeout` 打断、收尾 chown 没跑到"那一轮——它留下的还是 root 属主，只有容器里的 root 删得掉。顺带把 35 行 `Permission denied` 变成一行说明 |
+| 兜底也失败才 `exit 1`，并打印可直接执行的 `sudo rm -rf <路径>` | 真删不动时给的是处置动作，不是让用户再猜一轮 |
+
+**验证是真跑的，不是推演**（在 `/tmp/ownws` 里，只读 `/root/HR/backend`，不碰任何运行中的容器）：
+先手工造出 #16 的现场（`.ci-verify` 归 runner、里面的 `target` 归 root），以 `runner` 身份把「本次提交编译」段
+原样连跑三轮 —— 第 1 轮打印兜底清理并编出 30 个 class、跑完 `find .ci-verify -user root` 为 0；
+第 2、3 轮直接 `rm -rf` 就过（不再触发兜底），class 数恒为 30。
+真实现场那份 root 属主残留**故意留着**，让 #17 顺带把兜底分支在正式工作区里再验一次。
+
+#12、#13、#14 那三次红则与流水线代码无关：这个 job 的 `<lightweight>true</lightweight>`，
 **取 Jenkinsfile 这一步发生在 Windows 控制器上**（日志里能看到 `C:\Program Files\Git\bin\git.exe fetch`），
 控制器到 github.com 链路本来就抖，三次都是 `Recv failure: Connection was reset`，且都发生在
 `Start of Pipeline` 之前 —— agent 没参与、工作区没动。第 4 次点就过去了。
@@ -440,7 +471,7 @@ docker volume rm <卷名...> && docker network rm <网络名> && docker rmi <错
 | 部署本次提交 | 先读运行中容器的 `com.docker.compose.project` 标签和 `COMPOSE_PROJECT` 核对（不一致立刻停，不进 `up`）；三条凭据以环境变量注入 compose，`-p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend`；再验 6300 可达、并用 `/api/auth/login` 拿到 token 当就绪判据 | `project` 名不对（会得到一套空库的新栈，归属核对就是拦这个的）；凭据值与运行中 mysql/redis 不一致（后端连不上库，探活转满 120 秒后打容器 ERROR 行）；`--build` 失败看 `tests/logs/deploy.log` |
 | 接口用例 | 容器里跑 pytest 出 `tests/reports/junit.xml`，只为 JUnit 结果与趋势 | 用例本身；覆盖率不会因此算重（门禁首步清零并丢弃那次取数） |
 | 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID——这份 jar 现在就是上一段刚构建的产物 | 报告可信度的来源，日志里可追溯是哪份产物 |
-| 本次提交编译 | 把 `backend/{pom.xml,settings.xml,src}` 拷到 `.ci-verify/` 隔离副本，容器里 `mvn -DskipTests compile`，产出 class 数必须 > 0 | 本次检出的源码编译不过（与部署无关，先看代码）；或 maven 本地库缺插件导致在线下载失败 |
+| 本次提交编译 | 把 `backend/{pom.xml,settings.xml,src}` 拷到 `.ci-verify/` 隔离副本，容器里 `mvn -DskipTests compile`，产出 class 数必须 > 0；容器收尾用 `HOST_UID/HOST_GID` 把产物 chown 回 runner，宿主侧删不动时改用容器内的 root 清一次（见上节 #16） | 本次检出的源码编译不过（与部署无关，先看代码）；或 maven 本地库缺插件导致在线下载失败；报"root 属主残留"= 上一轮被 timeout 打断，兜底会自己清，清不动才手工 `sudo rm -rf` |
 | 覆盖率门禁 | `coverage_gate.py --deploy-mode file --checkout-classes /workspace/.ci-verify/target/classes`：先做部署一致性断言，再判阈值；不一致退出码 2、未达标退出码 1 | 有了部署段之后断言仍报红 = 那次部署没落到容器里（比对 `deploy.log` 里的 `Recreated`/`Running` 与落盘段打印的镜像 ID），不是覆盖率掉了 |
 | post | **先按 `.build-start` 过滤新鲜度**：本轮没产出 `junit.xml`/`summary.json` 就跳过发布并说明，只有本轮产物才 `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source`、`checkout_verified` 与三项实测值 | 上一轮残留被当成本轮结论（#11 修掉的洞：FAILURE 的构建曾报出 #10 的 `125 passed` 与 70.09%） |
 
