@@ -8,13 +8,19 @@
  * 控制器只做调度：工具链固化在 tests/Dockerfile 的镜像里，不从任何人的笔记本跑，报告也不写进被测服务的容器。
  *
  * 前置条件（缺任何一条，「执行平面自检」段会直接说清原因，不会让你去猜 mvn 的报错）：
- *   1. agent 账号在 docker 组里。组成员身份在登录时分配，加组后必须重连 agent（或重启 Jenkins）才生效。
- *   2. 两条 Jenkins 凭据：hr-api-admin（Username with password，接口用例的管理员账号）、
- *      hr-jwt-secret（Secret text，后端 hr.auth.jwt-secret，只 TC-AUTH-014 本地自签过期 token 用）。
- *   3. 被测后端用 coverage overlay 启动（走 Compose v2，v1.29 的 recreate 必崩）：
- *      docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend
+ *   1. agent 账号在 docker 组里（执行平面要能驱动 compose 重建后端）。组成员身份在登录时分配，
+ *      加组后必须重连 agent（或重启 Jenkins）才生效。
+ *   2. 四条 Jenkins 凭据：hr-api-admin（Username with password，接口用例的管理员账号），
+ *      hr-jwt-secret / hr-mysql-root-password / hr-redis-password（都是 Secret text，值由人从服务器 .env
+ *      抄进 Manage Jenkins 录入）。runner 读不到 /root/HR/.env，也不该读到——凭据就是为绕开它而存在的。
+ *   3. 被测环境的 hr-mysql / hr-redis 在运行且 healthy。流水线只重建 backend（--no-deps），
+ *      不启动、不重建数据服务，也不碰 hr_mysql-data 卷——那是在服务器上的运维动作。
+ *   4. 后端的镜像与部署由「部署本次提交」段完成（Compose v2 + coverage overlay；v1.29 的 recreate 必崩），
+ *      所以不需要事先手工 up -d backend。**代价要说清：这一段的 compose up 会重建 hr-backend 容器，
+ *      也就是重启对外提供服务的后端**（是否每次都重建由配置哈希与镜像 ID 决定，日志里
+ *      `Recreated` 与 `Running` 两种都算正常，看 tests/logs/deploy.log）。
  *
- * 关于工作区属主：容器内的 root 会在 gitignore 目录（backend/target、tests/reports、tests/logs）里留下
+ * 工作区属主：容器内的 root 会在 gitignore 目录（backend/target、tests/reports、tests/logs）里留下
  * root 属主、0644 的产物，Jenkins 读得到（archiveArtifacts 正常），但**不要开 cleanWs() 或
  * "Wipe Out Workspace"** —— runner 删不掉这些文件，会让构建无故变红。
  */
@@ -36,10 +42,16 @@ pipeline {
                description: '容器里 mvn 本地仓库对应的宿主目录（用 agent 账号自己的目录，不挂 /root）')
         string(name: 'BACKEND_CONTAINER', defaultValue: 'hr-backend',
                description: '被测后端容器名，运行中的字节码从它身上取')
+        string(name: 'COMPOSE_PROJECT', defaultValue: 'hr',
+               description: 'compose project 名，必须与被测环境现有 project 一致（-p）：一致才重建同一套容器、复用 hr_mysql-data 卷；填错会得到一套空库的新栈')
         string(name: 'HR_ADMIN_CREDENTIAL_ID', defaultValue: 'hr-api-admin',
                description: '接口用例管理员账号凭据（Username with password）')
         string(name: 'HR_JWT_CREDENTIAL_ID', defaultValue: 'hr-jwt-secret',
-               description: '后端 JWT 密钥凭据（Secret text）')
+               description: '后端 JWT 密钥凭据（Secret text）：部署时注入 HR_AUTH_JWT_SECRET，用例侧 TC-AUTH-014 本地自签过期 token 也用它')
+        string(name: 'HR_MYSQL_CREDENTIAL_ID', defaultValue: 'hr-mysql-root-password',
+               description: 'MYSQL_ROOT_PASSWORD 凭据（Secret text）：compose 插值 SPRING_DATASOURCE_PASSWORD 用，必须与运行中 mysql 的口令一致，否则后端连不上库')
+        string(name: 'HR_REDIS_CREDENTIAL_ID', defaultValue: 'hr-redis-password',
+               description: 'REDIS_PASSWORD 凭据（Secret text）：compose 插值 SPRING_DATA_REDIS_PASSWORD 与 redis --requirepass 用')
         string(name: 'MAIL_TO', defaultValue: '',
                description: '失败收件人，留空则不发邮件（SMTP 取全局 E-mail Notification 配置）')
     }
@@ -50,6 +62,8 @@ pipeline {
         // JaCoCo 的计数器是被测 JVM 里的一份全局状态，并发构建会互相清零，必须串行
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
+        // 预算按实测算：#10 全程 72.5 秒；部署段最坏是 compose build 缓存全冷 199 秒 + 容器重建与登录探活。
+        // 20 分钟对最坏一轮还有 4 倍以上余量，不去动它——超时该意味着真卡住了，而不是阈值给小了
         timeout(time: 20, unit: 'MINUTES')
     }
 
@@ -82,38 +96,30 @@ pipeline {
                     fi
                     echo "[自检] docker server $(docker version --format '{{.Server.Version}}')"
 
-                    if ! docker inspect "${BACKEND_CONTAINER}" >/dev/null 2>&1; then
-                        echo "[自检] 没有 ${BACKEND_CONTAINER} 容器，被测环境未就绪"
-                        exit 1
-                    fi
-                    # 只判断 agent 挂没挂上：grep -q 不打印任何 environment 值（那里面有真实口令）
-                    if ! docker inspect -f "{{range .Config.Env}}{{println .}}{{end}}" "${BACKEND_CONTAINER}" | grep -q jacocoagent.jar; then
-                        echo "[自检] ${BACKEND_CONTAINER} 没挂 JaCoCo agent，覆盖率无从采集。用 coverage overlay 重建："
-                        echo "       docker compose -f docker-compose.yml -f docker-compose.coverage.yml up -d backend"
-                        exit 1
-                    fi
-                    echo "[自检] ${BACKEND_CONTAINER} 已挂 JaCoCo agent"
+                    # 数据服务不归本流水线管（部署段只 --no-deps 重建 backend），所以缺了必须在这里就说清。
+                    # 否则要等部署段的登录探活转满 120 秒才失败，报出来的还是"后端没就绪"这种误导性结论
+                    for svc in hr-mysql hr-redis; do
+                        st=$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${svc}" 2>/dev/null || echo 缺失)
+                        echo "[自检] ${svc}: ${st}"
+                        if [ "${st}" != "running/healthy" ]; then
+                            echo "[自检] 数据服务没就绪。在服务器上先把它们起来（compose v2）："
+                            echo "       docker compose -f docker-compose.yml up -d mysql redis"
+                            exit 1
+                        fi
+                    done
 
                     if [ ! -f backend/settings.xml ]; then
                         echo "[自检] 仓库里没有 backend/settings.xml（镜像仓库配置随代码分发，checkout 应带回该文件）"
                         exit 1
                     fi
 
-                    # /api/health 是硬编码 UP（已知缺陷 D4），所以探活只看 8080 有没有 HTTP 应答，不看它
-                    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/ || echo 000)
-                    echo "[自检] 被测服务 8080 应答 HTTP ${code}"
-                    if [ "${code}" = "000" ]; then
-                        echo "[自检] 8080 无应答，检查 ${BACKEND_CONTAINER} 的端口发布与容器状态"
-                        exit 1
+                    # backend 容器在不在、agent 挂没挂、8080/6300 通不通，都不再是前置条件：
+                    # 这些正是「部署本次提交」段要产出的东西，由那一段自己验并给原因
+                    if docker inspect "${BACKEND_CONTAINER}" >/dev/null 2>&1; then
+                        echo "[自检] ${BACKEND_CONTAINER} 已存在（$(docker inspect -f '{{.Image}}' "${BACKEND_CONTAINER}" | cut -c8-19)），部署段按需重建它"
+                    else
+                        echo "[自检] ${BACKEND_CONTAINER} 不存在，由部署段首次创建"
                     fi
-
-                    # 采集端口必须先通，否则门禁里的 mvn dump 要重试十次才失败
-                    if ! bash -c 'exec 3<>/dev/tcp/127.0.0.1/6300' 2>/dev/null; then
-                        echo "[自检] 127.0.0.1:6300 连不上（JaCoCo tcpserver）。同机执行不需要隧道，"
-                        echo "       确认 coverage overlay 的端口发布绑在了 127.0.0.1"
-                        exit 1
-                    fi
-                    echo "[自检] 127.0.0.1:6300 可达"
                 '''
             }
         }
@@ -166,6 +172,67 @@ pipeline {
             }
         }
 
+        stage('部署本次提交') {
+            steps {
+                withCredentials([
+                    string(credentialsId: params.HR_MYSQL_CREDENTIAL_ID, variable: 'MYSQL_ROOT_PASSWORD'),
+                    string(credentialsId: params.HR_REDIS_CREDENTIAL_ID, variable: 'REDIS_PASSWORD'),
+                    string(credentialsId: params.HR_JWT_CREDENTIAL_ID, variable: 'HR_AUTH_JWT_SECRET')
+                ]) {
+                    sh '''
+                        umask 077
+                        # 口令只经 compose 的进程环境变量注入：不写 .env 文件、不出现在命令行上
+                        # （sh 步骤带 -x，命令行原文会进构建日志），也不要求 runner 能读 /root/HR/.env。
+                        # MYSQL_DATABASE 用 compose 里的 :-hr_db 默认值，已核对与服务器 .env 相同，不是凭据。
+                        # -p 与被测环境现有 project 一致，重建的才是同一套容器、同一份 hr_mysql-data 卷；
+                        # --no-deps 只动 backend，不重启 mysql/redis；一律 Compose v2（本机 v1.29 的 recreate 必崩）
+                        if ! docker compose -p "${COMPOSE_PROJECT}" \\
+                               -f docker-compose.yml -f docker-compose.coverage.yml \\
+                               up -d --build --no-deps backend > tests/logs/deploy.log 2>&1; then
+                            echo "[部署] compose 构建/启动失败，tests/logs/deploy.log 末尾："
+                            tail -30 tests/logs/deploy.log
+                            exit 1
+                        fi
+                        echo "[部署] compose 输出末尾："
+                        tail -5 tests/logs/deploy.log | sed 's/^/       /'
+                        echo "[部署] ${BACKEND_CONTAINER} 现用镜像 sha(前12) $(docker inspect -f '{{.Image}}' "${BACKEND_CONTAINER}" | cut -c8-19)"
+
+                        # 采集通道必须在用例之前通，否则门禁里的 jacoco dump 要重试十次才失败
+                        if ! bash -c 'exec 3<>/dev/tcp/127.0.0.1/6300' 2>/dev/null; then
+                            echo "[部署] 后端起了但 127.0.0.1:6300 连不上（JaCoCo tcpserver）——coverage overlay 没生效"
+                            exit 1
+                        fi
+                        echo "[部署] 127.0.0.1:6300 可达，覆盖率采集通道正常"
+
+                        # 就绪判据 = 用管理员账号真登录并拿到 token。/api/health 是硬编码 UP（已知缺陷 D4），
+                        # 拿它当判据会把"进程起来了但连不上 mysql/redis"的后端放过去，用例就整片红在原因之外
+                        if [ ! -f tests/config/.env.dev ]; then
+                            echo "[部署] 没有 tests/config/.env.dev，探活无从取账号（上一段「执行平面配置」没跑成？）"
+                            exit 1
+                        fi
+                        i=0
+                        while :; do
+                            i=$((i + 1))
+                            # 登录体由 python 从 .env.dev 现读现拼、经管道进 curl：口令既不落盘也不进 argv
+                            if python3 -c 'import json,pathlib; kv=dict(l.split("=",1) for l in pathlib.Path("tests/config/.env.dev").read_text(encoding="utf-8").splitlines() if "=" in l); print(json.dumps({"username":kv["HR_ADMIN_USER"],"password":kv["HR_ADMIN_PWD"]}))' \\
+                               | curl -s -m 5 -X POST -H 'Content-Type: application/json' \\
+                                     --data-binary @- http://127.0.0.1:8080/api/auth/login | grep -q '"token"'; then
+                                echo "[部署] 就绪：管理端登录拿到 token（第 ${i} 次探测）"
+                                break
+                            fi
+                            if [ "${i}" -ge 40 ]; then
+                                echo "[部署] 120 秒内登录不通，后端没有真正就绪。容器日志里的报错行："
+                                docker logs --tail 200 "${BACKEND_CONTAINER}" 2>&1 \\
+                                  | grep -E 'ERROR|Exception|Caused by' | tail -20
+                                exit 1
+                            fi
+                            sleep 3
+                        done
+                    '''
+                }
+            }
+        }
+
         stage('接口用例') {
             steps {
                 sh '''
@@ -183,7 +250,9 @@ pipeline {
             steps {
                 sh '''
                     # 门禁按 class id（类文件内容哈希）匹配执行数据，出报告用的必须是**正在运行**的那份字节码。
-                    # 落盘而不是在容器里现取：执行平面因此不需要免密 ssh，也不需要 docker 之外的权限
+                    # 落盘而不是在容器里现取：执行平面因此不需要免密 ssh，也不需要 docker 之外的权限。
+                    # 有了「部署本次提交」段，这份 jar 就是本轮构建的产物；下面「本次提交编译」段的逐文件
+                    # sha256 断言于是从"抓出忘了重新部署"升级成"证明那次部署真的落到了容器里"
                     docker cp "${BACKEND_CONTAINER}:/app/app.jar" backend/target/deployed/app.jar
                     echo "[字节码] $(wc -c < backend/target/deployed/app.jar) 字节，sha256(前16) $(sha256sum backend/target/deployed/app.jar | cut -c1-16)"
                     echo "[字节码] 来源 $(docker inspect -f '容器 {{.Id}} / 镜像 {{.Image}}' "${BACKEND_CONTAINER}")"

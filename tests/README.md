@@ -221,6 +221,9 @@ cd D:\hr-system\tests
 .venv\Scripts\python.exe coverage_gate.py --keep-classes         # 复用上一轮的字节码重算（调试用，非结论）
 .venv\Scripts\python.exe coverage_gate.py --build                # 本地编译字节码（服务跑本机时的调试，非结论）
 .venv\Scripts\python.exe coverage_gate.py --checkout-classes DIR # 出报告前先断言"部署包 == 本次检出编译产物"
+# 本地这几条只测环境上现装的那份包，不改部署。要让它等于本次提交，先在服务器上构建并部署：
+#   docker compose -p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend
+# （CI 里这一步已由「部署本次提交」段代劳，见下节）
 ```
 
 **执行平面与流水线（"在哪跑"也要固化成产物）**
@@ -244,7 +247,12 @@ docker build -t hr-testrunner:$(git rev-parse --short HEAD) \
 报的是 `Could not find a version ... (from versions: none)`，看不出真实原因是索引被跳过（2026-11-18 实测踩过）。
 
 ```bash
-# 每轮：先由部署步骤落盘字节码，再在 runner 容器里跑门禁（$WS 就是工作区，本机的 /root/HR 或 CI 的 workspace 都一样）
+# 每轮第一步：从本次检出构建并部署被测后端（Compose v2，project 名必须与被测环境一致）
+cd $WS   # 本机手跑 $WS=/root/HR；CI 是 /home/runner/workspace/hr-api-coverage-gate
+set -a; . ./.env; set +a                      # 口令从 .env 进环境变量，不进命令行、不进 shell 历史
+docker compose -p hr -f docker-compose.yml -f docker-compose.coverage.yml \
+  up -d --build --no-deps backend
+# 之后：落盘部署字节码，在 runner 容器里跑门禁
 docker cp hr-backend:/app/app.jar backend/target/deployed/app.jar
 # 编译本次检出的源码到隔离副本（不要在 backend/ 里编，原因见下节「部署一致性断言」）
 mkdir -p $WS/.ci-verify && cp -R backend/pom.xml backend/settings.xml backend/src $WS/.ci-verify/
@@ -324,6 +332,35 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 | 新增类但不重新部署 | 拦住：`本次编译 31 个 class、部署 30 个` + `ONLY-CHECKOUT com/hr/CiProbeAddedClass.class` |
 | 未改动的本次检出（正向） | 通过：30 个 class 全等，`125 passed`，行 70.09% / 分支 70.00%，门禁通过；含编译整轮 14 秒 |
 
+**部署段（`部署本次提交`，2026-11-19 加）**
+
+流水线自己从本次检出构建镜像并部署，"测的这份包就是这份提交"从此由构造保证，不再依赖有人在服务器上 `git pull` 过。
+四个设计点，每个都对应一条实测：
+
+- **`-p hr` 不是可选项**。被测栈现有 project 就叫 `hr`（`docker compose ls` 与容器的 `com.docker.compose.project`
+  标签都证实），卷叫 `hr_mysql-data`、网络叫 `hr_default`。project 名一换，compose 会得到**另一套容器 + 一个空库**，
+  用例在空库上跑出来的数字毫无意义，还白占 8080/6300 端口冲突。
+- **`--no-deps` 只重建 backend**。mysql/redis 的生命周期归服务器运维，流水线不启动、不重启、更不会删它们的数据卷。
+  自检段因此新增硬前置：`hr-mysql`/`hr-redis` 必须 `running/healthy`，缺了立刻报错，
+  而不是等部署段的登录探活转满 120 秒后报一句误导性的"后端没就绪"。
+- **口令走 compose 的进程环境变量，不落第二份 `.env`**。`withCredentials` 注入 `MYSQL_ROOT_PASSWORD`、
+  `REDIS_PASSWORD`、`HR_AUTH_JWT_SECRET` 三个变量名，compose 插值时直接读环境（实测哑元注入后
+  `docker compose config` 解析出的 `SPRING_DATASOURCE_URL`/`SPRING_DATA_REDIS_PASSWORD` 全部到位）。
+  这样 runner 不需要、也确实拿不到 `/root/HR/.env`（`/root` 是 `drwx------`）。`MYSQL_DATABASE` 不是凭据，
+  用 compose 里的 `:-hr_db` 默认值，已核对与服务器 `.env` 一致。
+- **就绪判据是真登录，不是 `/api/health`**。后者硬编码返回 UP（已知缺陷 D4），"进程起来了但连不上库"这种状态
+  它会照样放行，然后 125 条用例整片红在原因之外。探活直接 POST `/api/auth/login` 并检查响应里有 `"token"`，
+  登录体由 python 从 `tests/config/.env.dev` 现读现拼、经管道送进 curl —— 口令既不落盘也不进 argv（`sh` 步骤带 `-x`，
+  命令行原文会进构建日志）。40 次 × 3 秒兜底，超时才打容器日志里的 `ERROR|Exception|Caused by` 行。
+
+耗时与扰动都是实测：镜像构建在依赖层命中缓存时 **36 秒**（其中 `mvn clean package` 26 秒），缓存全冷 **199 秒**；
+探活块对着运行中的容器跑通只花 **0.1 秒**（第 1 次探测就拿到 token）。预跑用一次性 project 与哑元凭据完成，
+`hr-backend` 容器的 ID 与 `StartedAt` 前后一致——**没有扰动生产容器**，真正的 recreate 留给第一次真实构建，
+`tests/logs/deploy.log`（0600）里能看到 `Recreated` 还是 `Running`，两种都正常。
+
+顺带消掉一个口径歧义：`PasswordHasher.<clinit>` 那 +1 行只在"重启后的第一次登录落在测量窗口内"时才记为已覆盖，
+而探活的这次登录发生在门禁清零**之前**，所以无论容器重建与否，门禁量到的都是稳态的 321/458 = 70.09%。
+
 **流水线形态（仓库根 `Jenkinsfile`）**
 
 调度器是 Jenkins 控制器（Windows 本机），执行平面是服务器上的 SSH agent（`cloud-server`，label `cloud`，
@@ -332,16 +369,21 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 | 阶段 | 干什么 | 失败时最先怀疑什么 |
 | --- | --- | --- |
 | Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒） | 网络与解析，不是代码 |
-| 执行平面自检 | 验 docker 权限、agent 挂载、8080 有应答、6300 可达、`backend/settings.xml` 在位 | 没重连 agent（加组不重连等于没加）；后端没用 coverage overlay 重建 |
+| 执行平面自检 | 验 docker 权限、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
 | Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
 | 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
+| 部署本次提交 | 三条凭据以环境变量注入 compose，`-p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend`；再验 6300 可达、并用 `/api/auth/login` 拿到 token 当就绪判据 | `project` 名不对（会得到一套空库的新栈）；凭据值与运行中 mysql/redis 不一致（后端连不上库，探活转满 120 秒后打容器 ERROR 行）；`--build` 失败看 `tests/logs/deploy.log` |
 | 接口用例 | 容器里跑 pytest 出 `tests/reports/junit.xml`，只为 JUnit 结果与趋势 | 用例本身；覆盖率不会因此算重（门禁首步清零并丢弃那次取数） |
-| 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID | 报告可信度的来源，日志里可追溯是哪份产物 |
+| 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID——这份 jar 现在就是上一段刚构建的产物 | 报告可信度的来源，日志里可追溯是哪份产物 |
 | 本次提交编译 | 把 `backend/{pom.xml,settings.xml,src}` 拷到 `.ci-verify/` 隔离副本，容器里 `mvn -DskipTests compile`，产出 class 数必须 > 0 | 本次检出的源码编译不过（与部署无关，先看代码）；或 maven 本地库缺插件导致在线下载失败 |
-| 覆盖率门禁 | `coverage_gate.py --deploy-mode file --checkout-classes /workspace/.ci-verify/target/classes`：先做部署一致性断言，再判阈值；不一致退出码 2、未达标退出码 1 | 断言报红 = 后端改了没重新部署（照提示 `up -d --build backend`），不是覆盖率掉了 |
+| 覆盖率门禁 | `coverage_gate.py --deploy-mode file --checkout-classes /workspace/.ci-verify/target/classes`：先做部署一致性断言，再判阈值；不一致退出码 2、未达标退出码 1 | 有了部署段之后断言仍报红 = 那次部署没落到容器里（比对 `deploy.log` 里的 `Recreated`/`Running` 与落盘段打印的镜像 ID），不是覆盖率掉了 |
 | post | `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source`、`checkout_verified` 与三项实测值 | — |
 
-建 job：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
+建 job 前先备齐**四条凭据**（Manage Jenkins → Credentials → System → Global）：`hr-api-admin`
+（Username with password，接口用例的管理员账号）、`hr-jwt-secret` / `hr-mysql-root-password` / `hr-redis-password`
+（都是 Secret text，值由人从服务器 `.env` 里抄出来录入：`grep -E '^(HR_AUTH_JWT_SECRET|MYSQL_ROOT_PASSWORD|REDIS_PASSWORD)=' /root/HR/.env`）。
+凭据 ID 就是流水线参数 `HR_*_CREDENTIAL_ID` 的默认值，改名要同步改参数。
+job 本身：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
 `https://github.com/shiguanqiu521/HR.git`、Branch `master`、Script Path `Jenkinsfile`（仓库公开，无需凭据；
 不用 `gh-proxy` 之类第三方镜像，因为 Jenkinsfile 本身经此通道下发并会持有凭据，不该让镜像站进这条链路）。
 两个刻意设定：**`disableConcurrentBuilds()`**——JaCoCo 计数器是被测 JVM 里的一份全局状态，并发构建会互相清零；
