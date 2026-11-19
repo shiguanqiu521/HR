@@ -67,6 +67,15 @@ pipeline {
         timeout(time: 20, unit: 'MINUTES')
     }
 
+    environment {
+        // #11 的根因：Jenkins 只把"本次构建参数表里已有的"参数导成环境变量。新加的参数在**它第一次
+        // 被注册之前的那一轮**拿不到环境变量，shell 里 ${COMPOSE_PROJECT} 就是空串，compose 退回按
+        // 目录名推导 project（hr-api-coverage-gate），于是另建了一套网络 + 空 mysql-data/redis-data 卷，
+        // 最后撞在容器名冲突上。而 Groovy 侧 params.X 会退回 parameters{} 的默认值（所以两个凭据 ID 一直正常），
+        // 两种取值路径不一致，凡"只在 shell 里用"的新参数都必须在这里显式兜底，并由自检段验非空
+        COMPOSE_PROJECT = "${params.COMPOSE_PROJECT ?: 'hr'}"
+    }
+
     stages {
         stage('Checkout') {
             steps {
@@ -81,7 +90,12 @@ pipeline {
                         userRemoteConfigs: scm.userRemoteConfigs
                     ])
                 }
-                sh 'git log -1 --format="构建的提交：%h %ad %s" --date=iso'
+                sh '''
+                    git log -1 --format="构建的提交：%h %ad %s" --date=iso
+                    # 本轮产物的时间基准：post 只发布 mtime 晚于它的 junit.xml / summary.json。
+                    # 没这个基准就会出现 #11 那种场面——构建 FAILURE，页面却显示历轮的 125 passed 和 70.09%
+                    mkdir -p tests/logs && touch tests/logs/.build-start
+                '''
             }
         }
 
@@ -95,6 +109,23 @@ pipeline {
                         exit 1
                     fi
                     echo "[自检] docker server $(docker version --format '{{.Server.Version}}')"
+
+                    # 参数在 shell 里取到空值 = 本轮参数表里还没有它（新加参数的第一轮构建必踩，#11 实证：
+                    # -p 传空 → compose 按目录名推导 project → 另建一套空库卷）。在这里停，别让它往下走
+                    params_line=""
+                    for v in RUNNER_IMAGE DEPLOY_MODE MVN_LOCAL_REPO BACKEND_CONTAINER COMPOSE_PROJECT; do
+                        eval "val=\${$v:-}"
+                        if [ -z "${val}" ]; then
+                            echo "[自检] 参数 ${v} 在 shell 里是空值。Jenkins 只把「本次构建参数表里已有的」参数导成"
+                            echo "       环境变量，新增参数的第一轮构建拿不到它（Groovy 的 params.X 却有默认值，"
+                            echo "       所以只在 shell 里用的那种才会中招）。处置二选一："
+                            echo "       1) Build with Parameters 里显式填一次 ${v}，再重跑；"
+                            echo "       2) 在顶部 environment{} 里给它兜底（COMPOSE_PROJECT 已经是这么修的）"
+                            exit 1
+                        fi
+                        params_line="${params_line} ${v}=${val}"
+                    done
+                    echo "[自检] 参数齐备：${params_line}"
 
                     # 数据服务不归本流水线管（部署段只 --no-deps 重建 backend），所以缺了必须在这里就说清。
                     # 否则要等部署段的登录探活转满 120 秒才失败，报出来的还是"后端没就绪"这种误导性结论
@@ -181,10 +212,25 @@ pipeline {
                 ]) {
                     sh '''
                         umask 077
+                        # project 名不能只信参数：运行中的容器身上写着它属于哪个 project，以它为准比对。
+                        # 对不上就停在这里 —— 继续下去 compose 会另起一套容器和空库卷（#11 就是这样），
+                        # 更糟的是空库上照样能跑完 125 条用例并出一个看似正常的覆盖率数字
+                        if docker inspect "${BACKEND_CONTAINER}" >/dev/null 2>&1; then
+                            own=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "${BACKEND_CONTAINER}")
+                            echo "[部署] ${BACKEND_CONTAINER} 属于 compose project「${own:-无标签}」，本轮要用「${COMPOSE_PROJECT}」"
+                            if [ "${own}" != "${COMPOSE_PROJECT}" ]; then
+                                echo "[部署] 两者不一致，停。对不上意味着接下来这次 up 不会重建现有容器，"
+                                echo "       而是另起一套（独立网络 + 独立的空 mysql-data 卷），数字就测到空库上了。"
+                                echo "       参数 COMPOSE_PROJECT 留空/填错，或被测容器不是用 compose 起的（own 为空）"
+                                exit 1
+                            fi
+                        else
+                            echo "[部署] ${BACKEND_CONTAINER} 不存在，由本轮首次创建（project=${COMPOSE_PROJECT}）"
+                        fi
+
                         # 口令只经 compose 的进程环境变量注入：不写 .env 文件、不出现在命令行上
                         # （sh 步骤带 -x，命令行原文会进构建日志），也不要求 runner 能读 /root/HR/.env。
                         # MYSQL_DATABASE 用 compose 里的 :-hr_db 默认值，已核对与服务器 .env 相同，不是凭据。
-                        # -p 与被测环境现有 project 一致，重建的才是同一套容器、同一份 hr_mysql-data 卷；
                         # --no-deps 只动 backend，不重启 mysql/redis；一律 Compose v2（本机 v1.29 的 recreate 必崩）
                         if ! docker compose -p "${COMPOSE_PROJECT}" \\
                                -f docker-compose.yml -f docker-compose.coverage.yml \\
@@ -301,8 +347,13 @@ pipeline {
     post {
         always {
             sh '''
-                # 数字自证来源：classes_source 记的就是这一轮用哪条通道取回部署字节码
-                if [ -f tests/reports/coverage/summary.json ]; then
+                # 只认本轮产物。#11 就是反面教材：构建在部署段就红了，post 仍把历轮留下的 summary.json 念了一遍，
+                # 页面同时显示 FAILURE 与"70.09% 门禁通过"，那是假证据。时间基准是 Checkout 段落的 .build-start
+                if [ ! -f tests/logs/.build-start ]; then
+                    echo "[门禁] 没有本轮时间基准（Checkout 段没跑到），不发布任何覆盖率结论"
+                elif [ ! tests/reports/coverage/summary.json -nt tests/logs/.build-start ]; then
+                    echo "[门禁] 本轮没有产出 summary.json（工作区里那份早于本轮构建开始，是历轮残留，不作为本轮结论）"
+                else
                     python3 -c '
 import json
 d = json.load(open("tests/reports/coverage/summary.json", encoding="utf-8"))
@@ -315,19 +366,33 @@ for name in ("line", "branch", "method"):
     t = totals[name]
     print("       %-6s %d/%d = %s%%" % (name, t["covered"], t["total"], t["percent"]))
 '
-                else
-                    echo "[门禁] 没有 summary.json，本轮没出覆盖率结论（见上面失败阶段的自检提示）"
                 fi
             '''
-            junit testResults: 'tests/reports/junit.xml', allowEmptyResults: true
-            archiveArtifacts(
-                artifacts: 'tests/reports/coverage/summary.json, ' +
-                           'tests/reports/coverage/latest/index.html, ' +
-                           'tests/reports/coverage/latest/jacoco.xml, ' +
-                           'tests/reports/coverage/latest/jacoco.csv',
-                allowEmptyArchive: true,
-                fingerprint: false
-            )
+            script {
+                // junit 与归档一起按时间基准过滤。原先的 allowEmptyResults: true 恰恰掩盖了这一点：
+                // "本轮没跑用例"和"跑完全绿"在页面上都表现为收了上一份残留 junit.xml
+                def junitFresh = sh(returnStatus: true, script:
+                    '[ -f tests/logs/.build-start ] && [ tests/reports/junit.xml -nt tests/logs/.build-start ]') == 0
+                def reportFresh = sh(returnStatus: true, script:
+                    '[ -f tests/logs/.build-start ] && [ tests/reports/coverage/summary.json -nt tests/logs/.build-start ]') == 0
+                if (junitFresh) {
+                    junit testResults: 'tests/reports/junit.xml'
+                } else {
+                    echo "[发布] 本轮没跑用例，跳过 junit（收历轮残留那份就会造出 FAILURE 却 125 passed 的假象）"
+                }
+                if (reportFresh) {
+                    archiveArtifacts(
+                        artifacts: 'tests/reports/coverage/summary.json, ' +
+                                   'tests/reports/coverage/latest/index.html, ' +
+                                   'tests/reports/coverage/latest/jacoco.xml, ' +
+                                   'tests/reports/coverage/latest/jacoco.csv',
+                        allowEmptyArchive: true,
+                        fingerprint: false
+                    )
+                } else {
+                    echo "[发布] 本轮没有覆盖率报告，跳过归档"
+                }
+            }
         }
         failure {
             script {

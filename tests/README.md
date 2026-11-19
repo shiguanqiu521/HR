@@ -353,6 +353,37 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
   登录体由 python 从 `tests/config/.env.dev` 现读现拼、经管道送进 curl —— 口令既不落盘也不进 argv（`sh` 步骤带 `-x`，
   命令行原文会进构建日志）。40 次 × 3 秒兜底，超时才打容器日志里的 `ERROR|Exception|Caused by` 行。
 
+**#11 踩中的坑：`-p` 传成了空值（2026-11-19，三条修复都已实测过正反两个方向）**
+
+`docker compose -p  -f ... up` —— 日志里那个空位就是它。compose 在 `-p` 为空时**不报错**，退回按当前目录名推导
+project（工作区目录叫 `hr-api-coverage-gate`），于是它新建了 `hr-api-coverage-gate_default` 网络与
+`hr-api-coverage-gate_mysql-data`/`_redis-data` 两个**空库卷**，最后撞在容器名冲突上：
+`Conflict. The container name "/hr-backend" is already in use`。根因不是 compose，是 Jenkins 的参数注入语义：
+
+> **Jenkins 只把"本次构建参数表里已有的"参数导成环境变量。**新加的参数在它第一次被注册之前的那一轮拿不到，
+> shell 里 `${COMPOSE_PROJECT}` 就是空串；而 Groovy 侧 `params.X` 会退回 `parameters{}` 声明的默认值
+> （所以同一轮里 `withCredentials` 用的两条新凭据 ID 完全正常）。**两种取值路径不一致**，
+> "只在 shell 里用"的新参数才是盲区。#11 的凭据绑定成功、`-p` 为空，就是这个不对称的现场证据。
+
+三层修复，都验过：
+
+| 修复 | 位置 | 实测 |
+| --- | --- | --- |
+| 顶层 `environment { COMPOSE_PROJECT = "${params.COMPOSE_PROJECT ?: 'hr'}" }` 显式兜底 | `options` 之后 | — |
+| 自检段遍历"只在 shell 里用"的五个参数，空值立刻停并给处置办法 | `执行平面自检` | 复刻 #11 的参数集（缺 `COMPOSE_PROJECT`）→ 退出码 1；补上 → 放行 |
+| **project 归属以运行中的容器为准**：`docker inspect` 读 `com.docker.compose.project` 标签，与要用的 `-p` 不符就停在 `up` 之前 | `部署本次提交` | `hr` → 放行；空值与 `hr-test` → 都拦下，并说明"继续会另起一套空库卷" |
+
+第三条是关键：参数对不对，不看配置、看**被测容器身上写的归属**。否则一次填错就能让 125 条用例在空库上跑完，
+出一个数字看着完全正常、结论却毫无意义 —— 比红掉危险得多。
+
+失败轮留下的孤儿资源这样查与清（本次三个卷/网络都是空目录、无任何容器引用才删）：
+```bash
+docker network ls --format '{{.Name}}' | grep <错误的project名>
+docker volume ls --format '{{.Name}}' | grep <错误的project名>
+for v in <卷名>; do echo -n "$v -> "; docker ps -a -f volume="$v" --format '{{.Names}}'; done   # 必须为空
+docker volume rm <卷名...> && docker network rm <网络名> && docker rmi <错误project>-backend:latest
+```
+
 耗时与扰动都是实测：镜像构建在依赖层命中缓存时 **36 秒**（其中 `mvn clean package` 26 秒），缓存全冷 **199 秒**；
 探活块对着运行中的容器跑通只花 **0.1 秒**（第 1 次探测就拿到 token）。预跑用一次性 project 与哑元凭据完成，
 `hr-backend` 容器的 ID 与 `StartedAt` 前后一致——**没有扰动生产容器**，真正的 recreate 留给第一次真实构建，
@@ -368,16 +399,16 @@ docker run --rm --network host -e TZ=Asia/Shanghai \
 
 | 阶段 | 干什么 | 失败时最先怀疑什么 |
 | --- | --- | --- |
-| Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒） | 网络与解析，不是代码 |
-| 执行平面自检 | 验 docker 权限、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
+| Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒）；末尾 `touch tests/logs/.build-start` 作为本轮产物时间基准 | 网络与解析，不是代码 |
+| 执行平面自检 | 验 docker 权限、**五个"只在 shell 里用"的参数非空**、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 参数空值（新增参数没进 `environment{}` 兜底，见下节 #11）；没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
 | Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
 | 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
-| 部署本次提交 | 三条凭据以环境变量注入 compose，`-p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend`；再验 6300 可达、并用 `/api/auth/login` 拿到 token 当就绪判据 | `project` 名不对（会得到一套空库的新栈）；凭据值与运行中 mysql/redis 不一致（后端连不上库，探活转满 120 秒后打容器 ERROR 行）；`--build` 失败看 `tests/logs/deploy.log` |
+| 部署本次提交 | 先读运行中容器的 `com.docker.compose.project` 标签和 `COMPOSE_PROJECT` 核对（不一致立刻停，不进 `up`）；三条凭据以环境变量注入 compose，`-p hr -f docker-compose.yml -f docker-compose.coverage.yml up -d --build --no-deps backend`；再验 6300 可达、并用 `/api/auth/login` 拿到 token 当就绪判据 | `project` 名不对（会得到一套空库的新栈，归属核对就是拦这个的）；凭据值与运行中 mysql/redis 不一致（后端连不上库，探活转满 120 秒后打容器 ERROR 行）；`--build` 失败看 `tests/logs/deploy.log` |
 | 接口用例 | 容器里跑 pytest 出 `tests/reports/junit.xml`，只为 JUnit 结果与趋势 | 用例本身；覆盖率不会因此算重（门禁首步清零并丢弃那次取数） |
 | 部署字节码落盘 | `docker cp` 运行中容器的 `/app/app.jar`，打印字节数、sha256 前缀、容器与镜像 ID——这份 jar 现在就是上一段刚构建的产物 | 报告可信度的来源，日志里可追溯是哪份产物 |
 | 本次提交编译 | 把 `backend/{pom.xml,settings.xml,src}` 拷到 `.ci-verify/` 隔离副本，容器里 `mvn -DskipTests compile`，产出 class 数必须 > 0 | 本次检出的源码编译不过（与部署无关，先看代码）；或 maven 本地库缺插件导致在线下载失败 |
 | 覆盖率门禁 | `coverage_gate.py --deploy-mode file --checkout-classes /workspace/.ci-verify/target/classes`：先做部署一致性断言，再判阈值；不一致退出码 2、未达标退出码 1 | 有了部署段之后断言仍报红 = 那次部署没落到容器里（比对 `deploy.log` 里的 `Recreated`/`Running` 与落盘段打印的镜像 ID），不是覆盖率掉了 |
-| post | `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source`、`checkout_verified` 与三项实测值 | — |
+| post | **先按 `.build-start` 过滤新鲜度**：本轮没产出 `junit.xml`/`summary.json` 就跳过发布并说明，只有本轮产物才 `junit` + `archiveArtifacts`（`summary.json`、JaCoCo `index.html`/`xml`/`csv`）；构建末尾打印 `classes_source`、`checkout_verified` 与三项实测值 | 上一轮残留被当成本轮结论（#11 修掉的洞：FAILURE 的构建曾报出 #10 的 `125 passed` 与 70.09%） |
 
 建 job 前先备齐**四条凭据**（Manage Jenkins → Credentials → System → Global）：`hr-api-admin`
 （Username with password，接口用例的管理员账号）、`hr-jwt-secret` / `hr-mysql-root-password` / `hr-redis-password`
