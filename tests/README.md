@@ -54,6 +54,8 @@ tests/
 ├── logs/                   # 日志文件输出
 ├── run.py                  # 统一测试执行入口（推荐）
 ├── coverage_gate.py        # 覆盖率归因与门禁（统计后端代码，非测试脚本）
+├── Dockerfile              # 执行平面（runner）镜像：固化 mvn + python 依赖，用例代码靠 bind mount 进来
+├── .dockerignore           # 构建上下文白名单，只带 requirements.txt（环境文件不进镜像层）
 ├── pytest.ini              # pytest 配置（testpaths、allure 输出目录、markers）
 ├── requirements.txt        # 依赖
 └── README.md               # 本文件
@@ -70,6 +72,7 @@ tests/
 | dev 实测（2026-11-17，覆盖率门禁同轮） | 22 | 72 | 30 | **124 passed / 0 failed / 0 skipped**，22.91s |
 | dev 实测（2026-11-18 上午，补 4 条 `TC-META-*` 后同轮） | 22 | 76 | 30 | **128 passed / 0 failed / 0 skipped**，23.46s（该 4 条已于同日接口收敛时删除） |
 | dev 实测（2026-11-18 下午，接口收敛后重建部署、覆盖率门禁同轮） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，26.15s |
+| runner 容器内实测（2026-11-18 晚，与被测后端同机） | 22 | 72 | 31 | **125 passed / 0 failed / 0 skipped**，4.30s（同轮覆盖率见下节，与本地逐字相同） |
 
 - 用例表：`../HR系统测试用例.xlsx`（功能测试 121 行 = 93 有效 + 19 已删除标注行；有效用例变更类型分布 修改 48 / 新增 16 / 不变 29），逐条变更记录见「用例变更记录」sheet（95 条）。
 - `TC-AUTH-014`（过期 token 本地自签）已在 `config/.env.dev` 填入与服务端一致的 `HR_JWT_SECRET` 后转执行，2026-11-17 实测通过，无 skipped。
@@ -85,6 +88,9 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+> 需要可复现的执行环境（不依赖某个人本机装了什么）时，用 runner 镜像代替这套本机 venv：
+> `docker build -t hr-testrunner -f tests/Dockerfile tests/`，形态与限制见「覆盖率归因与门禁 → 执行平面与流水线」。
 
 > Allure 命令行工具需单独安装（用于生成 HTML 报告）：
 > - macOS：`brew install allure`
@@ -198,8 +204,11 @@ ssh -N -L 6300:127.0.0.1:6300 root@106.12.144.134
 # 并由云安全组把 6300 限制到指定来源 IP；采集时加 --dump-host 106.12.144.134
 ```
 
-取部署字节码（`[准备]` 步骤）走的是同一条 ssh 通道，需要本机公钥已加入服务器 `authorized_keys`、
-可以非交互执行 `docker exec`；不满足时脚本以退出码 2 停下，不会给出不可比的数字。
+取部署字节码（`[准备]` 步骤）有**两条通道**，由 `config/coverage.yml` 的 `deploy.mode` 选择：
+`ssh`（默认）复用上面那条 ssh 通道现场取，需要本机公钥已加入服务器 `authorized_keys`、能非交互执行 `docker exec`；
+`file` 读部署步骤 `docker cp` 落盘的 `deploy.local_jar`，不需要 ssh 免密、也不需要 docker 权限，给 CI / 同机执行用。
+两条通道已实测**逐字节一致**（同一份部署产物各取一次，30 个 class 的 sha256 全等），所以两个平面的数字能互相印证。
+任一通道不满足时脚本以退出码 2 停下，不会给出不可比的数字。
 
 **每轮执行（本地，需先起好 SSH 隧道）**
 ```bash
@@ -211,6 +220,62 @@ cd D:\hr-system\tests
 .venv\Scripts\python.exe coverage_gate.py --keep-classes         # 复用上一轮的字节码重算（调试用，非结论）
 .venv\Scripts\python.exe coverage_gate.py --build                # 本地编译字节码（服务跑本机时的调试，非结论）
 ```
+
+**执行平面与流水线（"在哪跑"也要固化成产物）**
+
+三个平面各归各处：**被测环境**只负责被测（`/root/HR` 上的 hr-backend），**执行平面**负责装工具链、跑用例、出报告，
+**产物存储**负责让人看到（CI artifact / Pages / Allure 服务）。覆盖率报告**不在被测服务器上**，也不是遗漏：
+JaCoCo 的计数器在被测 JVM 内部，但驱动它的是外部请求，所以形态是"被测侧留 agent 端口 → 执行侧拉数据出报告 →
+产物侧存历史"。被测机器上既没有 mvn 也不该有——它是 runtime 镜像，连编译器都不带。
+
+本项目的执行平面实况是：服务器 `mvn MISSING`、pypi 公网源全断（百度云内网源可用），所以工具链固化成镜像：
+
+```bash
+cd /root/HR
+docker build -t hr-testrunner:$(git rev-parse --short HEAD) \
+  --build-arg PIP_INDEX_URL=http://mirrors.baidubce.com/pypi/simple \
+  --build-arg PIP_TRUSTED_HOST=mirrors.baidubce.com \
+  -f tests/Dockerfile tests/
+```
+
+`PIP_TRUSTED_HOST` 不是可选项：内网镜像源只提供 HTTP 时 pip 会**静默忽略**这个索引，
+报的是 `Could not find a version ... (from versions: none)`，看不出真实原因是索引被跳过（2026-11-18 实测踩过）。
+
+```bash
+# 每轮：先由部署步骤落盘字节码，再在 runner 容器里跑门禁
+docker cp hr-backend:/app/app.jar backend/target/deployed/app.jar
+sed 's/^  mode: ssh/  mode: file/' tests/config/coverage.yml > tests/logs/coverage.ci.yml
+docker run --rm --network host -e TZ=Asia/Shanghai \
+  -v /root/HR:/workspace \
+  -v /root/.m2:/root/.m2 \
+  -v /root/HR/backend/settings.xml:/root/.m2/settings.xml:ro \
+  hr-testrunner:latest python3 tests/coverage_gate.py --config tests/logs/coverage.ci.yml
+```
+
+- `--network host`：容器里 `127.0.0.1` 就是宿主回环，才能直连 8080 与只绑回环的 6300，不需要 SSH 隧道。
+- **不挂 `/var/run/docker.sock`**：那等于把宿主机 root 交给测试通道（这台机器的 3306 曾被公网打穿过，见评审记录）。
+  代价就是字节码不能现场 `docker exec` 取，改用 `deploy.mode=file` 读部署步骤落盘的 jar——权限与可信度都要保住。
+- `-v /root/.m2`：maven 本地库持久化。首轮要下载 jacoco 插件与 spring-boot parent，之后复用。
+- `-e TZ=Asia/Shanghai`：镜像默认 UTC，不加则 `reports/coverage/<时间戳>` 目录名和 `summary.json.captured_at`
+  比宿主时间早 8 小时（实测：不带 09:41 UTC，带了 17:41 CST）。
+- `deploy.mode` 默认仍是 `ssh`（本机驱动远端部署是对的），CI 用 `file`。上面用 `--config` 指到 gitignored 副本，
+  是为了不改仓库里的默认值；正式形态倾向给门禁加 `--deploy-mode` 参数，而不是长期维护第二份 yml。
+- 服务器侧 `tests/config/.env.dev` 不在版本库里（`.gitignore:31`），首跑要单独准备并 `chmod 600`，
+  并把 `HR_BASE_URL` 改成 `http://127.0.0.1:8080`（同机执行不必绕公网）。缺这个文件时 `switch_env("dev")`
+  直接抛 `FileNotFoundError`，pytest 一条也收集不到——这是"环境文件不入版本库"必然要付的准备成本。
+
+**两个平面的等价性实测（2026-11-18 晚，同一部署、同一用例集）**
+
+| 平面 | 字节码通道 | 用例执行 | 行 | 分支 | 方法 | 门禁 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 本地 Windows（SSH 隧道 + 公网打 8080） | `deployed-ssh` | 125 passed，22.18s | 321/458 = 70.09% | 56/80 = 70.00% | 133/177 = 75.14% | 通过 |
+| runner 容器（同机、打 127.0.0.1） | `deployed-file` | 125 passed，4.30s | 321/458 = 70.09% | 同上 | 同上 | 通过 |
+| runner 容器复现轮 | `deployed-file` | 125 passed，4.12s | 321/458 = 70.09% | 同上 | 同上 | 通过 |
+
+三轮的**分包明细也逐项相同**（八个包，含 `com.hr.config` 0/52、`com.hr.service` 76/89），
+说明这个数字不是某台机器的偶然；容器侧快 5 倍是网络往返的差，与覆盖无关。
+`summary.json.meta.classes_source` 会写明本轮用的是 `deployed-ssh` 还是 `deployed-file`，
+每轮报告都能自证字节码来源，不必靠人记。
 
 **输出**
 - 终端：按包的行/分支/方法覆盖率表 + 合计 + 门禁判定，未达标退出码 1（可直接接 CI）
@@ -255,7 +320,7 @@ cd D:\hr-system\tests
   两个通道的数字**不能相加也不能互相印证**：门禁判定只认接口用例通道；单元测试通道走 `mvn test`，
   它度量的是单元测试写得好不好，回答不了"接口用例集覆盖了系统多少代码"。
 - **字节码口径决定数字是否可信**：执行数据与字节码按 class id（类文件内容哈希）匹配，报告默认在采集前
-  用 `config/coverage.yml` 的 `deploy.ssh` 从运行中的容器取回 `BOOT-INF/classes` 覆盖 `backend/target/classes`，
+  按 `deploy.mode` 取回运行中的 `BOOT-INF/classes`（`ssh` 现场取 / `file` 读落盘 jar）覆盖 `backend/target/classes`，
   保证出报告用的就是实际执行的那份。本机 javac 与构建镜像的 JDK 补丁版本不同就会产出不同的类文件，
   id 对不上的类被 JaCoCo **静默丢弃**（显示 0% 而不是报错）——2026-11-17 实测因此丢掉了整个 `EmployeeService`，
   `com.hr.service` 只报 45.05%，而取回部署字节码后的干净单轮是 83.52%。

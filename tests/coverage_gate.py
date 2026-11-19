@@ -12,8 +12,11 @@
     ./.venv/Scripts/python.exe coverage_gate.py --check-only     # 不跑用例，只读上一轮清零之后新跑到的代码
     ./.venv/Scripts/python.exe coverage_gate.py --update-thresholds   # 用本轮实测值刷新门禁阈值（棘轮）
 
+CI / 与被测服务同机执行时走 runner 镜像（tests/Dockerfile）+ deploy.mode=file，
+命令形态见 tests/README.md「执行平面与流水线」——那条通道不需要 ssh 免密，也不需要 docker 权限。
+
 字节码口径（决定数字是否可信）：
-    默认在出报告前，从运行中的容器里取回 BOOT-INF/classes 覆盖 backend/target/classes，
+    默认在出报告前取回运行中的 BOOT-INF/classes 覆盖 backend/target/classes，
     保证报告用的就是实际执行的那份字节码。JaCoCo 按 class id（类文件内容哈希）匹配执行数据，
     本地重新编译只要与构建镜像的 JDK 补丁版本有差异就会静默丢类（显示 0% 而非报错）。
     --build 改用本地 mvn compile，仅用于本机直连部署的调试，不能用于出覆盖率结论。
