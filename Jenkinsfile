@@ -18,7 +18,11 @@
  *   4. 后端的镜像与部署由「部署本次提交」段完成（Compose v2 + coverage overlay；v1.29 的 recreate 必崩），
  *      所以不需要事先手工 up -d backend。**代价要说清：这一段的 compose up 会重建 hr-backend 容器，
  *      也就是重启对外提供服务的后端**（是否每次都重建由配置哈希与镜像 ID 决定，日志里
- *      `Recreated` 与 `Running` 两种都算正常，看 tests/logs/deploy.log）。
+ *      `Recreated` 与 `Running` 两种都算正常，看 tests/logs/deploy.log；但 #16/#24 实测都是 `Recreated`，
+ *      因为 `--build` 出的镜像层哈希每次都变，别把"源码没改就不会重启"当预期）。
+ *   5. 已挂 `triggers { cron('0 3 * * *') }`：**每天 03:00（控制器时区，UTC+8）自动跑一轮全量，
+ *      也就每天固定有一次约 20 秒的后端重启**，没有新提交也一样。不想让它自动跑就删这一行、推上去、
+ *      再点一次构建让 Declarative 把 job 配置里的日程表清掉。
  *
  * 工作区属主：容器内的 root 会在 gitignore 目录（backend/target、tests/reports、tests/logs）里留下
  * root 属主、0644 的产物，Jenkins 读得到（archiveArtifacts 正常），但**不要开 cleanWs() 或
@@ -62,6 +66,12 @@ pipeline {
         // JaCoCo 的计数器是被测 JVM 里的一份全局状态，并发构建会互相清零，必须串行
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
+        // 每天 03:00 自动跑一轮全量（控制器时区 = 本机 Windows，UTC+8，与服务器一致）。
+        // 刻意用固定 0 分而不是 H：H 只是把负载打散到某个小时内，单 job 无收益，反而让"凌晨 3 点"变成模糊承诺。
+        // 两条必须知道的代价：① 本流水线含「部署本次提交」，实测每次都是 Recreated → **每天固定重启后端约 20 秒**，
+        // 没有新提交也照样跑；② 这个 cron 是 Declarative 在**构建跑过一次之后**才写进 job 配置的，
+        // 所以改完推上去要点一次 Build 让它落地，之后 job 配置页才会显示日程表
+        triggers { cron('0 3 * * *') }
         // 预算按实测算：#10 全程 72.5 秒；部署段最坏是 compose build 缓存全冷 199 秒 + 容器重建与登录探活。
         // 20 分钟对最坏一轮还有 4 倍以上余量，不去动它——超时该意味着真卡住了，而不是阈值给小了
         timeout(time: 20, unit: 'MINUTES')
@@ -79,9 +89,11 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                // 百度内网 DNS 把 github.com 解析到 20.6.7.17，该地址只回 refs、传不了 pack，
-                // 表现为 fetch 挂死后被 SIGTERM。已在服务器 /etc/hosts 固定为实测可用的 140.82.112.4。
-                // 跨境链路全量 clone 实测 56~65s，这里显式给 5 分钟超时，不依赖 job 里的 Advanced Clone behaviours 取值。
+                // github 在这台机器上不能当常量用：百度内网 DNS 给的 20.6.7.17 只回 refs、传不了 pack，
+                // 表现为 fetch 挂死后被 SIGTERM；而"可用 IP"按分钟漂，实测同一个地址上午通、下午 0 字节。
+                // /etc/hosts 里那块钉位现由服务器上的 github-ip-probe systemd timer 每 5 分钟按"真克隆成功"自愈维护
+                // （手工改会被下一轮重写），所以这里只负责容忍：跨境全量 clone 实测 27~120s，
+                // 显式给 5 分钟超时（不依赖 job 里的 Advanced Clone behaviours），并用 retry(3) 撞可用窗口
                 retry(3) {
                     checkout([
                         $class: 'GitSCM',

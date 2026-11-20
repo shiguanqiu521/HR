@@ -546,7 +546,7 @@ ERROR: script returned exit code 1
 
 | 阶段 | 干什么 | 失败时最先怀疑什么 |
 | --- | --- | --- |
-| Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 需服务器 `/etc/hosts` 钉可用 IP，全量传输实测 34~65 秒）；末尾 `touch tests/logs/.build-start` 作为本轮产物时间基准 | 网络与解析，不是代码 |
+| Checkout | `retry(3)` + 显式 `CloneOption timeout: 5` 拉 master（github.com 的可用 IP 由服务器上的 `github-ip-probe` timer 每 5 分钟自愈维护，见上节 #17~#19；全量传输实测 27~120 秒且按分钟漂）；末尾 `touch tests/logs/.build-start` 作为本轮产物时间基准 | 网络与解析，不是代码 |
 | 执行平面自检 | 验 docker 权限、**五个"只在 shell 里用"的参数逐个非空**、`hr-mysql`/`hr-redis` 是 `running/healthy`、`backend/settings.xml` 在位；顺带报出 `hr-backend` 现用镜像 | 参数空值（新增参数没进 `environment{}` 兜底，见上节 #11）；块里混进 bash 写法（`sh` 步骤的解释器是 dash，见上节 #15）；没重连 agent（加组不重连等于没加）；数据服务没起（部署段只管 backend） |
 | Runner 镜像 | 镜像缺失或 `REBUILD_RUNNER=true` 才 build，之后 `pytest --version` + `mvn -v` 复验 | 内网 pip 索引少了 `PIP_TRUSTED_HOST` |
 | 执行平面配置 | `withCredentials` 生成 `tests/config/.env.dev`（0600，日志只出键名与长度） | 凭据 ID 或类型不对 |
@@ -564,6 +564,17 @@ ERROR: script returned exit code 1
 job 本身：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
 `https://github.com/shiguanqiu521/HR.git`、Branch `master`、Script Path `Jenkinsfile`（仓库公开，无需凭据；
 不用 `gh-proxy` 之类第三方镜像，因为 Jenkinsfile 本身经此通道下发并会持有凭据，不该让镜像站进这条链路）。
+**触发方式**：`triggers { cron('0 3 * * *') }` —— 每天 03:00（控制器时区，本机 Windows 与服务器同为 UTC+8）
+自动跑一轮全量。要清楚它买到什么、花掉什么：买到的是"每天有一份带门禁的基线，不用人记得点"；
+花掉的是**每天固定一次约 20 秒的后端重启**（本流水线自带部署段，`--build` 出的镜像层哈希每次都变，
+实测 #16/#24 都是 `Recreated`，没有新提交也照重启）。两个实现层面的事实：cron 是 Declarative 在
+**构建跑过一次之后**才写进 job 配置的（改完推上去要点一次 Build 才落地，之后 job 配置页才看得到日程表）；
+github → Jenkins 的 webhook 在这套拓扑下**不成立**（控制面无公网 IP、`slaveAgentPort=-1`，回调进不来），
+Poll SCM 又要把变更检测压在 Windows 控制器那条反复抖过的 github 链路上（#12~#14），所以选了 cron。
+另有一条已知盲区：cron 触发的构建如果**连 Jenkinsfile 都没取回来**（轻量检出失败在 `Start of Pipeline` 之前），
+`post { failure { emailext } }` 根本不会执行 —— 这种失败没人被通知，只能早上看一眼构建历史；
+要覆盖它得在 **job 配置层**留一份通知，那是另一件事，没做就别写进"已具备"。
+
 两个刻意设定：**`disableConcurrentBuilds()`**——JaCoCo 计数器是被测 JVM 里的一份全局状态，并发构建会互相清零；
 **不开 `cleanWs()`**——容器内 root 在 gitignore 目录里留下 0644 产物，runner 读得到（归档正常）但删不掉，
 工作区一清就让构建无故变红。
