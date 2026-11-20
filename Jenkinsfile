@@ -320,11 +320,13 @@ pipeline {
                     # 容器里的 mvn 以 root 写 /verify，本轮之后 host 侧的 runner 就删不掉那份 target。
                     # #16 正是停在这里：rm -rf 打出 35 行 Permission denied 后退出码 1。
                     # 收尾 chown 是常规路径；下面的兜底处理"构建被 timeout 打断、chown 没跑到"那一轮，
-                    # 它留下的还是 root 属主，只有容器内的 root 删得掉
-                    rm -rf .ci-verify 2>/dev/null
+                    # 它留下的还是 root 属主，只有容器内的 root 删得掉。
+                    # || true 不是随手加的：Jenkins 用 sh -xe 跑这一段，rm 一失败 set -e 就地终止，
+                    # 兜底分支根本没机会执行（#23 就是这么红的——比 #16 安静，但一样红）
+                    rm -rf .ci-verify 2>/dev/null || true
                     if [ -e .ci-verify ]; then
                         echo "[编译] .ci-verify 里有 root 属主残留（历轮容器写入、收尾 chown 没跑到），用容器内的 root 清一次"
-                        docker run --rm -v "${WORKSPACE}:/ws" "${RUNNER_IMAGE}" sh -c 'rm -rf /ws/.ci-verify'
+                        docker run --rm -v "${WORKSPACE}:/ws" "${RUNNER_IMAGE}" sh -c 'rm -rf /ws/.ci-verify' || true
                     fi
                     if [ -e .ci-verify ]; then
                         echo "[编译] 还是删不掉，在服务器上手工执行后重跑：sudo rm -rf ${WORKSPACE}/.ci-verify"
