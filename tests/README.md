@@ -564,16 +564,64 @@ ERROR: script returned exit code 1
 job 本身：New Item → **Pipeline** → Pipeline script from SCM → Git，URL 用官方
 `https://github.com/shiguanqiu521/HR.git`、Branch `master`、Script Path `Jenkinsfile`（仓库公开，无需凭据；
 不用 `gh-proxy` 之类第三方镜像，因为 Jenkinsfile 本身经此通道下发并会持有凭据，不该让镜像站进这条链路）。
-**触发方式**：`triggers { cron('0 3 * * *') }` —— 每天 03:00（控制器时区，本机 Windows 与服务器同为 UTC+8）
+**触发方式**：pipeline 级段落 `triggers { cron('0 3 * * *') }` —— 每天 03:00（控制器时区，本机 Windows 与服务器同为 UTC+8）
 自动跑一轮全量。要清楚它买到什么、花掉什么：买到的是"每天有一份带门禁的基线，不用人记得点"；
 花掉的是**每天固定一次约 20 秒的后端重启**（本流水线自带部署段，`--build` 出的镜像层哈希每次都变，
 实测 #16/#24 都是 `Recreated`，没有新提交也照重启）。两个实现层面的事实：cron 是 Declarative 在
 **构建跑过一次之后**才写进 job 配置的（改完推上去要点一次 Build 才落地，之后 job 配置页才看得到日程表）；
 github → Jenkins 的 webhook 在这套拓扑下**不成立**（控制面无公网 IP、`slaveAgentPort=-1`，回调进不来），
 Poll SCM 又要把变更检测压在 Windows 控制器那条反复抖过的 github 链路上（#12~#14），所以选了 cron。
+
+**`triggers` 只能放在 pipeline 级，不能写进 `options{}`**（#25~#34 十轮为此白红，每轮 2~4 秒）：写错位置时报
+`WorkflowScript: 74: Options definitions cannot have blocks`，这是**解析期**失败 —— 不分配 agent、不跑任何 stage、
+不碰服务器，所以那十轮对被测环境零副作用，但也不会打印任何有用的 stage 信息，只在日志第 4 行。
+同一类坑还有：`parameters{}`、`triggers{}`、`environment{}`、`stages{}`、`post{}` 都是段落；`options{}` 里只放**不带闭包体的定义项**
+（`timestamps()`、`timeout(...)`、`disableConcurrentBuilds()`、`buildDiscarder(...)`、`skipDefaultCheckout(...)`），
+要往配置里塞别的段落就用 `properties([...])` 那条路。
+
+**改 Jenkinsfile 的离线校验（不用点 Build，也不用等抖一次的 github 链路）**：这台 Jenkins 装了 `pipeline-model-definition`，
+它自带 CLI 命令 `declarative-linter`（`/jenkins/cli` 页面或 Script Console 里列 `CLICommand` 扩展点都能看到它注册），用的就是构建时那套校验器。
+可移植的形态是 CLI，jar 在 `http://localhost:8080/jenkins/jnlpJars/jenkins-cli.jar`（实测 200、11.7 MB；`/cli/jenkins-cli.jar` 是 404），
+`-auth` 用 API token（用户 → 配置 → API Token and SSH Keys → 新建），**别把登录口令写进命令行**：
+
+```bash
+java -jar jenkins-cli.jar -s http://localhost:8080/jenkins/ -auth <用户>:<API token> \
+     declarative-linter < Jenkinsfile
+```
+
+判据是输出 `Jenkinsfile successfully validated.`（退出码 0）；不通过时逐条打 `WorkflowScript: <行号>: <错误>`，退出码 1。
+
+2026-11-20 我这边实跑的是**同一条命令、但不必带凭据**的 Script Console 形态（管理员页面里贴进去就能跑，`main` 在 2.580 上是实例方法，
+所以要先建克隆再把当前会话的身份塞进 transportAuth）：
+
+```groovy
+def cls = Class.forName('hudson.cli.CLICommand')
+def c = jenkins.model.Jenkins.get().getExtensionList(cls).find{ it.name=='declarative-linter' }.createClone()
+def sa = cls.getDeclaredMethod('setTransportAuth', org.acegisecurity.Authentication); sa.setAccessible(true)
+sa.invoke(c, jenkins.model.Jenkins.getAuthentication())
+def m = cls.getDeclaredMethod('main', java.util.List, java.util.Locale, java.io.InputStream, java.io.PrintStream, java.io.PrintStream)
+def o = new java.io.ByteArrayOutputStream(); def er = new java.io.ByteArrayOutputStream()
+def src = new File('D:/hr-system/Jenkinsfile').getText('UTF-8')
+println 'RC=' + m.invoke(c, [], java.util.Locale.ENGLISH, new java.io.ByteArrayInputStream(src.getBytes('UTF-8')),
+                          new java.io.PrintStream(o, true, 'UTF-8'), new java.io.PrintStream(er, true, 'UTF-8'))
+println o.toString('UTF-8') + er.toString('UTF-8')
+```
+
+（`m.invoke` 的第一个参数是**空列表**：命令行里那个 `declarative-linter` 只用来选中命令，不是它的参数；塞进去会报
+`No argument is allowed`。不设 transportAuth 则报 `anonymous is missing the Overall/Read permission`。）
+
+这一步不能被其它校验替代：**dash 桩执行只管 `sh` 块的语义层，管不到 Declarative 的段落结构**；而 `triggers{}` 写在 `options{}` 里
+在 Groovy 语法层完全合法（就是个带闭包参数的方法调用），`groovyc` 过得了 —— 只有 Declarative 自己的校验器知道它位置不对。
+所以约定是：**动过 Jenkinsfile 的非 `sh` 部分，先跑 linter，再推、再点 Build**。
+
+
 另有一条已知盲区：cron 触发的构建如果**连 Jenkinsfile 都没取回来**（轻量检出失败在 `Start of Pipeline` 之前），
 `post { failure { emailext } }` 根本不会执行 —— 这种失败没人被通知，只能早上看一眼构建历史；
-要覆盖它得在 **job 配置层**留一份通知，那是另一件事，没做就别写进"已具备"。
+而且 2026-11-20 实测确认：**这条路堵不到 job 配置层**。Pipeline 类型的 job 配置页只有 描述 / Triggers / 流水线 / Advanced 四段，
+**没有「构建后操作」**（`WorkflowJob` 不继承 `AbstractProject`，`publishers` 列表对它不存在），所以 email-ext 的
+"Editable Email Notification" 挂不上去，它只能以 `emailext` 步骤存在于 Jenkinsfile 内 —— 而盲区恰恰是 Jenkinsfile 自身不可用时。
+真要堵只能引入**另一种有 publishers 的 job**（freestyle 看门狗：自己的 cron + 读 `jobs/<job>/last-build.xml` 判 result/时间戳 + post-build 邮件）。**没做，就别写进"已具备"。**
+
 
 两个刻意设定：**`disableConcurrentBuilds()`**——JaCoCo 计数器是被测 JVM 里的一份全局状态，并发构建会互相清零；
 **不开 `cleanWs()`**——容器内 root 在 gitignore 目录里留下 0644 产物，runner 读得到（归档正常）但删不掉，

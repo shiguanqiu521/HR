@@ -66,15 +66,20 @@ pipeline {
         // JaCoCo 的计数器是被测 JVM 里的一份全局状态，并发构建会互相清零，必须串行
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
-        // 每天 03:00 自动跑一轮全量（控制器时区 = 本机 Windows，UTC+8，与服务器一致）。
-        // 刻意用固定 0 分而不是 H：H 只是把负载打散到某个小时内，单 job 无收益，反而让"凌晨 3 点"变成模糊承诺。
-        // 两条必须知道的代价：① 本流水线含「部署本次提交」，实测每次都是 Recreated → **每天固定重启后端约 20 秒**，
-        // 没有新提交也照样跑；② 这个 cron 是 Declarative 在**构建跑过一次之后**才写进 job 配置的，
-        // 所以改完推上去要点一次 Build 让它落地，之后 job 配置页才会显示日程表
-        triggers { cron('0 3 * * *') }
         // 预算按实测算：#10 全程 72.5 秒；部署段最坏是 compose build 缓存全冷 199 秒 + 容器重建与登录探活。
         // 20 分钟对最坏一轮还有 4 倍以上余量，不去动它——超时该意味着真卡住了，而不是阈值给小了
         timeout(time: 20, unit: 'MINUTES')
+    }
+
+    // 每天 03:00 自动跑一轮全量（控制器时区 = 本机 Windows，UTC+8，与服务器一致）。
+    // triggers 只能是 pipeline 级段落，写进 options{} 会在编译期报 "Options definitions cannot have blocks"，
+    // 那一类失败发生在解析期：不分配 agent、不碰服务器，日志 2 秒红、一个 stage 都没有。
+    // 刻意用固定 0 分而不是 H：H 只是把负载打散到某个小时内，单 job 无收益，反而让"凌晨 3 点"变成模糊承诺。
+    // 两条必须知道的代价：① 本流水线含「部署本次提交」，实测每次都是 Recreated → 每天固定重启后端约 20 秒，
+    // 没有新提交也照样跑；② 这个日程表是 Declarative 在**构建跑过一次之后**才写进 job 配置的，
+    // 所以改完推上去要点一次 Build 让它落地，之后 job 配置页才会显示日程表
+    triggers {
+        cron('0 3 * * *')
     }
 
     environment {
