@@ -447,7 +447,8 @@ ERROR: script returned exit code 1
 先手工造出 #16 的现场（`.ci-verify` 归 runner、里面的 `target` 归 root），以 `runner` 身份把「本次提交编译」段
 原样连跑三轮 —— 第 1 轮打印兜底清理并编出 30 个 class、跑完 `find .ci-verify -user root` 为 0；
 第 2、3 轮直接 `rm -rf` 就过（不再触发兜底），class 数恒为 30。
-真实现场那份 root 属主残留**故意留着**，让 #17 顺带把兜底分支在正式工作区里再验一次。
+真实现场那份 root 属主残留**故意留着**：它先在 #23 上暴露出"`set -e` 抢在兜底分支之前终止"（见下文 #23 一节），
+修好后由 #24 在正式工作区把兜底那条路真跑了一遍（#24 之后 `.ci-verify` 里 root 属主条目归 0，见 #23 一节的观测表）。
 
 #12、#13、#14 那三次红则与流水线代码无关：这个 job 的 `<lightweight>true</lightweight>`，
 **取 Jenkinsfile 这一步发生在 Windows 控制器上**（日志里能看到 `C:\Program Files\Git\bin\git.exe fetch`），
@@ -524,6 +525,19 @@ ERROR: script returned exit code 1
 新镜像 `e80b8349ef58`、6300 可达、登录第 6 次探测拿到 token、`125 passed in 7.36s`、
 字节码落盘 61074733 字节 `sha256 3b9fbdd4eb6fac0f`；post 的本轮新鲜度判定也按设计拒绝了历轮残留的
 `summary.json`（"不作为本轮结论"）。**门禁数字这一轮没产出，"覆盖率门禁"那一段还没在真构建里跑通过。**
+
+**#24 已经跑通了，上面那句"还没在真构建里跑通过"作废（2026-11-20 16:29，`Finished: SUCCESS`）**。
+这一轮检出的就是本次提交 `1c902b1`，逐条对上了 #16 留下的那张核对清单：
+
+| 观测 | 值 |
+| --- | --- |
+| 兜底分支在**正式工作区**真跑 | `[编译] .ci-verify 里有 root 属主残留…用容器内的 root 清一次`（那份残留是 #16 故意留的） |
+| 本次检出编译 | `[编译] 本次检出编译出 30 个 class` |
+| 部署一致性断言 | `部署一致性断言通过：本次编译与部署字节码全等（30 个 class 逐文件 sha256 相同）`，post 打 `checkout_verified=True` |
+| 部署段 | project 核对「hr」、新镜像 `28aa20fd06cd`、6300 可达、token 第 6 次探测 |
+| 门禁 | `125 passed in 5.39s`、`line 321/458 = 70.09% / 阈值 70% → 达标`、`branch 56/80 = 70.00% → 达标`、`method 133/177 = 75.14%`、字节码来源 `deployed-file` |
+
+**这条流水线到此是"每段都在真构建里绿过"的状态**，不是"预跑通过 + 推断能绿"。
 
 **流水线形态（仓库根 `Jenkinsfile`）**
 
